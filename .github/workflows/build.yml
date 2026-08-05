@@ -1,0 +1,53 @@
+name: Build DEB
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-13
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Theos
+        run: |
+          export THEOS=/opt/theos
+          sudo mkdir -p $THEOS
+          sudo chown -R $(whoami) $THEOS
+          git clone --recursive --depth 1 https://github.com/theos/theos.git $THEOS
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
+
+      - name: Download ImGui
+        run: |
+          IMGUI_VER="v1.91.0"
+          curl -fsSL "https://github.com/ocornut/imgui/archive/refs/tags/${IMGUI_VER}.tar.gz" | tar xz
+          mkdir -p ImGui
+          cp imgui-1.91.0/*.h ImGui/
+          cp imgui-1.91.0/*.cpp ImGui/
+          cp imgui-1.91.0/backends/imgui_impl_metal.h ImGui/
+          cp imgui-1.91.0/backends/imgui_impl_metal.mm ImGui/
+          rm -rf imgui-1.91.0
+          echo "ImGui files downloaded:"
+          ls -la ImGui/
+
+      - name: Build Package
+        run: |
+          make package FINALPACKAGE=1
+
+      - name: List Packages
+        run: |
+          echo "=== Built packages ==="
+          find packages -type f -name "*.deb" -exec ls -lh {} \;
+
+      - name: Upload DEB Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AimAssist-DEB
+          path: packages/*.deb
+          retention-days: 90
