@@ -38,29 +38,41 @@
 }
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *hitView = [super hitTest:point withEvent:event];
-    if (hitView == self || hitView == self.subviews.firstObject) {
-        ImGuiContext *ctx = ImGui::GetCurrentContext();
-        if (ctx) {
-            ImGuiIO &io = ImGui::GetIO();
-            // ── 精确热区判断：只有触摸点在 ImGui 面板矩形内才拦截 ──
-            BOOL insidePanel = CGRectContainsPoint(_imguiPanelRect, point);
-            if (insidePanel && (io.WantCaptureMouse || io.WantCaptureKeyboard)) {
-                return hitView;  // ImGui 处理
-            }
-        }
-        // ── 穿透到游戏：遍历所有窗口，找到最前面的游戏窗口 ──
-        NSArray<UIWindow *> *windows = [self.class allWindows];
-        for (NSInteger i = windows.count - 1; i >= 0; i--) {
-            UIWindow *w = windows[i];
-            if (w == self || w.hidden || !w.userInteractionEnabled) continue;
-            if (w.windowLevel >= self.windowLevel) continue;
-            UIView *gameHit = [w hitTest:point withEvent:event];
-            if (gameHit) return gameHit;
-        }
-        return nil;
+    // ── 第1步：判断触摸点是否在 ImGui 面板矩形内 ──
+    BOOL insidePanel = CGRectContainsPoint(_imguiPanelRect, point);
+
+    if (!insidePanel) {
+        // ── 完全在面板外 → 直接穿透到游戏 ──
+        // 不调用 super hitTest，不返回任何本窗口的 view
+        return [self hitTestForwardToGame:point withEvent:event];
     }
-    return hitView;
+
+    // ── 在面板内 → 检查 ImGui 是否需要捕获 ──
+    ImGuiContext *ctx = ImGui::GetCurrentContext();
+    if (ctx) {
+        ImGuiIO &io = ImGui::GetIO();
+        if (io.WantCaptureMouse || io.WantCaptureKeyboard) {
+            // ImGui 需要捕获 → 返回正常的 hitTest 结果
+            return [super hitTest:point withEvent:event];
+        }
+    }
+
+    // ── ImGui 不需要捕获 → 穿透到游戏 ──
+    return [self hitTestForwardToGame:point withEvent:event];
+}
+
+/// 将触摸转发到游戏窗口
+- (UIView *)hitTestForwardToGame:(CGPoint)point withEvent:(UIEvent *)event {
+    NSArray<UIWindow *> *windows = [self.class allWindows];
+    // 从最上层开始遍历，找到本窗口之下的游戏窗口
+    for (NSInteger i = windows.count - 1; i >= 0; i--) {
+        UIWindow *w = windows[i];
+        if (w == self || w.hidden || !w.userInteractionEnabled) continue;
+        if (w.windowLevel >= self.windowLevel) continue;
+        UIView *gameHit = [w hitTest:point withEvent:event];
+        if (gameHit) return gameHit;
+    }
+    return nil;
 }
 
 // ── 触摸事件转发到 ImGui ──
