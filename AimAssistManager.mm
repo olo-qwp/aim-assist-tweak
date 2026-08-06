@@ -22,14 +22,14 @@ static NSString *const kHeadshotSnapRadiusKey = @"AimAssist_HeadshotSnapRadius";
     self = [super init];
     if (self) {
         _enabled            = YES;
-        _strength           = 0.95f;          // 95% — 极强平滑
-        _smoothingFactor    = 0.81f;          // strength * 0.85
+        _strength           = 0.5f;           // 50% — 自然手感
+        _smoothingFactor    = 0.125f;         // strength * 0.25
         _fovEnabled         = YES;
-        _fovRadius          = 300.0f;         // 300pt FOV
+        _fovRadius          = 200.0f;         // 200pt FOV（视觉+微调）
         _snapToCenter       = YES;
-        _centerPullStrength = 0.85f;          // 85% 磁吸
-        _headshotMode       = YES;
-        _headshotSnapRadius = 40.0f;          // 40pt 锁定区
+        _centerPullStrength = 0.4f;           // 40% → 实际拉力 1.2%
+        _headshotMode       = NO;             // 默认关闭，不再强制吸附
+        _headshotSnapRadius = 30.0f;
     }
     return self;
 }
@@ -44,7 +44,7 @@ static NSString *const kHeadshotSnapRadiusKey = @"AimAssist_HeadshotSnapRadius";
     if ([d objectForKey:kCenterPullStrengthKey]) _centerPullStrength = [d floatForKey:kCenterPullStrengthKey];
     if ([d objectForKey:kHeadshotModeKey])       _headshotMode       = [d boolForKey:kHeadshotModeKey];
     if ([d objectForKey:kHeadshotSnapRadiusKey]) _headshotSnapRadius = [d floatForKey:kHeadshotSnapRadiusKey];
-    _smoothingFactor = _strength * 0.85f;
+    _smoothingFactor = _strength * 0.25f;
 }
 
 - (void)saveSettings {
@@ -58,7 +58,7 @@ static NSString *const kHeadshotSnapRadiusKey = @"AimAssist_HeadshotSnapRadius";
     [d setBool:_headshotMode       forKey:kHeadshotModeKey];
     [d setFloat:_headshotSnapRadius forKey:kHeadshotSnapRadiusKey];
     [d synchronize];
-    _smoothingFactor = _strength * 0.85f;
+    _smoothingFactor = _strength * 0.25f;
 }
 
 - (float)distanceFromCenter:(CGPoint)p {
@@ -76,14 +76,14 @@ static NSString *const kHeadshotSnapRadiusKey = @"AimAssist_HeadshotSnapRadius";
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  核心滤波算法（Unity 优化版）
+//  核心滤波算法 — 自然手感版
 //
-//  ── 在任何情况下都施加 EMA 平滑
-//  ── 在任何情况下都施加中心磁吸（FOV 内增强）
-//  ── 头击模式：锁定区直接拉到中心，FOV 内额外增强
-//  ── 平滑系数 = smoothingFactor + FOV 增强
-//  ── 磁吸力度 = centerPullStrength × FOV 影响因子
-//  ── FOV 外仍有 10% 基础磁吸，确保准星持续向中心收敛
+//  设计原则：
+//  1. EMA 平滑系数很低 (0.05~0.25)，大部分移动直接传递，只平滑抖动
+//  2. 中心拉力极弱 (1~3%)，仅辅助压枪，不和手指对抗
+//  3. 不做强制吸附，玩家始终拥有控制权
+//  4. FOV 内略微增强平滑 (+0.05)，FOV 外正常
+//  5. 头击模式：仅在锁定区附近增强拉力 (×2)，不吸附到中心
 // ═══════════════════════════════════════════════════════════════════════════
 - (CGPoint)processTouchMovement:(CGPoint)raw previousPoint:(CGPoint)prev {
     if (!_enabled || _strength <= 0.0f) return raw;
@@ -93,57 +93,39 @@ static NSString *const kHeadshotSnapRadiusKey = @"AimAssist_HeadshotSnapRadius";
     float cy = screen.height * 0.5f;
     float dist = sqrtf((raw.x - cx) * (raw.x - cx) + (raw.y - cy) * (raw.y - cy));
 
-    // ── 1. 头击锁定 ──
-    if (_headshotMode && dist < _headshotSnapRadius) {
-        return CGPointMake(cx, cy);
-    }
-
-    // ── 2. EMA 平滑（始终） ──
+    // ── 1. 基础 EMA 平滑（始终） ──
     float factor = _smoothingFactor;
+
+    // ── 2. FOV 内增强平滑（微调） ──
+    BOOL inFov = _fovEnabled && (dist < _fovRadius);
+    if (inFov) {
+        float influence = 1.0f - (dist / _fovRadius);
+        factor += influence * 0.05f;  // 最多 +5%
+    }
+    factor = fminf(factor, 0.30f);  // 上限 30%（70% 移动量）
+
     float x = prev.x + (raw.x - prev.x) * (1.0f - factor);
     float y = prev.y + (raw.y - prev.y) * (1.0f - factor);
 
-    // ── 3. 基础磁吸（FOV 外 10%，FOV 内增强） ──
+    // ── 3. 中心拉力（极弱，仅辅助压枪） ──
     if (_snapToCenter && _centerPullStrength > 0.0f) {
-        BOOL inFov = _fovEnabled && (dist < _fovRadius);
+        float pull = _centerPullStrength * 0.03f;  // 基础 1.2%
 
         if (inFov) {
-            // FOV 内：越靠近中心磁吸越强
-            float influence = 1.0f - (dist / _fovRadius);   // 0~1
-            float boost = influence * 0.55f * _strength;     // 最大 52%
-            if (_headshotMode) boost *= 1.5f;
-            float adjFactor = fminf(factor + boost, 0.97f);
-
-            // 重新用增强系数做平滑
-            x = prev.x + (raw.x - prev.x) * (1.0f - adjFactor);
-            y = prev.y + (raw.y - prev.y) * (1.0f - adjFactor);
-
-            // FOV 内磁吸
-            float pull = _centerPullStrength * influence * _strength * 0.65f;
-            if (_headshotMode) {
-                pull = fminf(pull * 3.0f, 0.95f);
-            } else {
-                pull = fminf(pull, 0.8f);
-            }
-
-            CGPoint s = [self snapTowardCenter:CGPointMake(x, y) strength:pull];
-            x = s.x; y = s.y;
-
-            // 头击模式：锁定区附近额外拉
-            if (_headshotMode) {
-                float d = sqrtf((x - cx) * (x - cx) + (y - cy) * (y - cy));
-                if (d < _headshotSnapRadius * 3.0f) {
-                    float extra = _centerPullStrength * 0.65f;
-                    x += (cx - x) * extra;
-                    y += (cy - y) * extra;
-                }
-            }
-        } else {
-            // FOV 外：基础磁吸 10%
-            float basePull = _centerPullStrength * 0.10f;
-            x += (cx - x) * basePull;
-            y += (cy - y) * basePull;
+            // FOV 内：拉力随距离增强
+            float influence = 1.0f - (dist / _fovRadius);
+            pull = _centerPullStrength * (0.02f + influence * 0.04f);  // 0.8%~2.4%
         }
+
+        // 头击模式：锁定区附近拉力翻倍（不吸附，仅增强）
+        if (_headshotMode && dist < _headshotSnapRadius * 3.0f) {
+            pull *= 2.0f;  // 最多 ~4.8%
+        }
+
+        pull = fminf(pull, 0.05f);  // 硬上限 5%
+
+        x += (cx - x) * pull;
+        y += (cy - y) * pull;
     }
 
     return CGPointMake(x, y);
@@ -151,7 +133,7 @@ static NSString *const kHeadshotSnapRadiusKey = @"AimAssist_HeadshotSnapRadius";
 
 - (void)setStrength:(float)s {
     _strength = s;
-    _smoothingFactor = s * 0.85f;
+    _smoothingFactor = s * 0.25f;
 }
 
 @end

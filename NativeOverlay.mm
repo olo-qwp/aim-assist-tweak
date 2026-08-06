@@ -551,4 +551,9 @@
     return !_overlayWindow.hidden;
 }
 
+- (CGRect)panelFrame {
+    if (!_panelView || _panelView.hidden || _panelView.alpha < 0.01) return CGRectNull;
+    return _panelView.frame;
+}
+
 @end
