@@ -9,11 +9,16 @@ on:
 
 jobs:
   build:
-    runs-on: macos-13
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld ldid fakeroot dpkg-dev perl curl
 
       - name: Setup Theos
         run: |
@@ -22,6 +27,19 @@ jobs:
           sudo chown -R $(whoami) $THEOS
           git clone --recursive --depth 1 https://github.com/theos/theos.git $THEOS
           echo "THEOS=$THEOS" >> $GITHUB_ENV
+
+      - name: Download SDK
+        run: |
+          # Download iOS SDK for cross-compilation
+          SDK_URL="https://github.com/theos/sdks/archive/refs/heads/master.tar.gz"
+          curl -fsSL "$SDK_URL" | tar xz
+          mkdir -p /opt/theos/sdks
+          # If sdks-master contains iPhoneOS SDK, copy it
+          if [ -d sdks-master ]; then
+            find sdks-master -name "iPhoneOS*.sdk" -exec cp -r {} /opt/theos/sdks/ \;
+          fi
+          # Fallback: create symlink to system SDKs if needed
+          ls -la /opt/theos/sdks/ || echo "No SDK found, will use system"
 
       - name: Download ImGui
         run: |
