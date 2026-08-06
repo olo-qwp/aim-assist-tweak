@@ -4,48 +4,64 @@
 #import "NativeOverlay.h"
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Ivar 直接修改方案 — 核心设计
+//  双路径触摸修改 — 全覆盖架构
 //
-//  Unity 引擎可能通过以下任一方式读取触摸坐标：
-//    1. [touch locationInView:view]   → 内部读取 _locationInWindow ivar
-//    2. [touch _locationInWindow]      → 私有方法，读取同一 ivar
-//    3. 直接访问 _locationInWindow ivar → 绕过所有方法
+//  路径A：方法Hook（locationInView: / previousLocationInView: / precise* 变体）
+//    → 适用于通过公开API读取坐标的游戏
 //
-//  因此，hook locationInView: 不够可靠。
-//  正确做法：在 sendEvent: 中直接修改 UITouch 的内部 ivar：
-//    _locationInWindow          ← 当前帧滤波值
-//    _previousLocationInWindow  ← 上一帧滤波值
+//  路径B：Ivar直接修改（_locationInWindow / _previousLocationInWindow）
+//    → 适用于直接读取内部ivar的游戏
 //
-//  这样无论 Unity 用什么方式读取，拿到的都是滤波后的坐标。
-//  locationInView: / previousLocationInView: 无需 hook，它们自动读取修改后的 ivar。
+//  两条路径同时工作，确保无论游戏用哪种方式读取，都能拿到滤波后的值。
+//
+//  偏移量系统：不修改绝对坐标，只计算 offset = filtered - raw
+//    locationInView:        返回 %orig(view) + offset
+//    previousLocationInView: 返回 %orig(view) + prevOffset
+//    → 坐标转换由 %orig 处理，兼容所有view坐标系
+//    → delta = (raw+offset) - (rawPrev+prevOffset) = filteredCurr - filteredPrev ✓
+//
+//  仅处理右半屏起始的触摸（瞄准区），左半屏（移动摇杆）不修改。
 // ═══════════════════════════════════════════════════════════════════════════
 
-// 关联对象：存储每个 touch 上一帧的滤波输出
-static const void *kPrevFilteredKey = &kPrevFilteredKey;
+// ── 关联对象 Key ──
+static const void *kOffsetKey       = &kOffsetKey;       // 当前帧偏移
+static const void *kPrevOffsetKey   = &kPrevOffsetKey;   // 上一帧偏移
+static const void *kPrevFilteredKey = &kPrevFilteredKey; // 上一帧滤波值
+static const void *kStartXKey       = &kStartXKey;       // 触摸起始X（判断左右半屏）
 
-// UITouch 内部 ivar 的内存偏移量（运行时查找）
-static ptrdiff_t g_locOffset     = -1;  // _locationInWindow
-static ptrdiff_t g_prevLocOffset = -1;  // _previousLocationInWindow
+// ── 处理标志 ──
+// sendEvent: 期间设为 YES，使方法hook返回原始值（%orig）
+static BOOL g_isProcessing = NO;
 
-// ── 直接读写 ivar 内存 ──
-static CGPoint aa_readIvar(id obj, ptrdiff_t offset) {
-    if (offset < 0) return CGPointZero;
-    return *(CGPoint *)((char *)(__bridge void *)obj + offset);
-}
+// ── Ivar 偏移量 ──
+static ptrdiff_t g_locOffset     = -1;
+static ptrdiff_t g_prevLocOffset = -1;
 
+// ── Ivar 写入（读取不需要，方法hook的%orig会处理） ──
 static void aa_writeIvar(id obj, ptrdiff_t offset, CGPoint val) {
     if (offset < 0) return;
     *(CGPoint *)((char *)(__bridge void *)obj + offset) = val;
 }
 
-// ── 运行时查找 UITouch 的内部 ivar 偏移量 ──
+// ── 关联对象读写 ──
+static CGPoint aa_getPoint(id obj, const void *key) {
+    NSValue *v = objc_getAssociatedObject(obj, key);
+    return v ? [v CGPointValue] : CGPointZero;
+}
+
+static void aa_setPoint(id obj, const void *key, CGPoint p) {
+    objc_setAssociatedObject(obj, key,
+                             [NSValue valueWithCGPoint:p],
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// ── 运行时查找 UITouch ivar 偏移量（无类型检查，更宽松） ──
 static void aa_findTouchIvars() {
     unsigned int count = 0;
     Ivar *ivars = class_copyIvarList([UITouch class], &count);
     for (unsigned int i = 0; i < count; i++) {
         const char *name = ivar_getName(ivars[i]);
-        const char *type = ivar_getTypeEncoding(ivars[i]);
-        if (!name || !type || type[0] != '{') continue;
+        if (!name) continue;
 
         if (strcmp(name, "_locationInWindow") == 0) {
             g_locOffset = ivar_getOffset(ivars[i]);
@@ -55,13 +71,12 @@ static void aa_findTouchIvars() {
     }
     free(ivars);
 
-    // 兼容不同 iOS 版本的备用名称
+    // 模糊匹配兜底
     if (g_locOffset < 0 || g_prevLocOffset < 0) {
         ivars = class_copyIvarList([UITouch class], &count);
         for (unsigned int i = 0; i < count; i++) {
             const char *name = ivar_getName(ivars[i]);
-            const char *type = ivar_getTypeEncoding(ivars[i]);
-            if (!name || !type || type[0] != '{') continue;
+            if (!name) continue;
 
             if (g_locOffset < 0 && strstr(name, "locationInWindow") && !strstr(name, "previous")) {
                 g_locOffset = ivar_getOffset(ivars[i]);
@@ -77,18 +92,11 @@ static void aa_findTouchIvars() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  UIApplication sendEvent: — 在系统更新 ivar 后、Unity 读取前修改
-//
-//  时序：
-//    1. 系统更新 _locationInWindow = 新原始坐标，_previousLocationInWindow = 上一帧原始坐标
-//    2. sendEvent: 被调用（我们的 hook）
-//    3. 我们读取 _locationInWindow（原始值），计算滤波，覆写两个 ivar
-//    4. %orig 执行 → Unity 读取 touch 坐标 → 拿到滤波后的值 ✓
+//  UIApplication sendEvent: — 预计算偏移量 + 修改 ivar
 // ═══════════════════════════════════════════════════════════════════════════
 %hook UIApplication
 
 - (void)sendEvent:(UIEvent *)event {
-    // ── 初始化（只一次） ──
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         aa_findTouchIvars();
@@ -100,54 +108,125 @@ static void aa_findTouchIvars() {
 
     if (event.type == UIEventTypeTouches) {
         AimAssistManager *mgr = [AimAssistManager sharedManager];
-        if (mgr.enabled && mgr.strength > 0.0f && g_locOffset >= 0) {
+        if (mgr.enabled && mgr.strength > 0.0f) {
+            CGFloat halfW = [UIScreen mainScreen].bounds.size.width * 0.5f;
+            CGRect panelFrame = [[NativeOverlay sharedOverlay] panelFrame];
+
+            g_isProcessing = YES;
+
             for (UITouch *touch in [event allTouches]) {
                 UITouchPhase phase = touch.phase;
 
+                // 获取原始坐标（g_isProcessing=YES 时 hook 返回 %orig）
+                CGPoint raw = [touch locationInView:nil];
+
                 if (phase == UITouchPhaseBegan) {
-                    // 初始化：记录原始坐标作为上一帧滤波值
-                    CGPoint raw = aa_readIvar(touch, g_locOffset);
-                    if (CGPointEqualToPoint(raw, CGPointZero)) {
-                        raw = [touch locationInView:nil];
-                    }
-                    objc_setAssociatedObject(touch, kPrevFilteredKey,
-                        [NSValue valueWithCGPoint:raw],
-                        OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                    // 记录起始位置
+                    aa_setPoint(touch, kStartXKey, raw);
+                    aa_setPoint(touch, kPrevFilteredKey, raw);
+                    aa_setPoint(touch, kOffsetKey, CGPointZero);
+                    aa_setPoint(touch, kPrevOffsetKey, CGPointZero);
                     continue;
                 }
 
                 if (phase != UITouchPhaseMoved) continue;
 
-                // ── 读取原始坐标（系统刚写入 _locationInWindow） ──
-                CGPoint raw = aa_readIvar(touch, g_locOffset);
-                if (CGPointEqualToPoint(raw, CGPointZero)) {
-                    raw = [touch locationInView:nil];
+                // ── 仅处理右半屏起始的触摸（瞄准区） ──
+                CGFloat startX = aa_getPoint(touch, kStartXKey).x;
+                if (startX < halfW) {
+                    // 左半屏（移动摇杆）：不滤波
+                    aa_setPoint(touch, kOffsetKey, CGPointZero);
+                    aa_setPoint(touch, kPrevOffsetKey, CGPointZero);
+                    aa_setPoint(touch, kPrevFilteredKey, raw);
+                    continue;
                 }
 
-                // ── 读取上一帧滤波值 ──
-                NSValue *prevVal = objc_getAssociatedObject(touch, kPrevFilteredKey);
-                CGPoint prev = prevVal ? [prevVal CGPointValue] : raw;
+                // ── 跳过控制面板区域的触摸 ──
+                if (!CGRectIsNull(panelFrame) && CGRectContainsPoint(panelFrame, raw)) {
+                    aa_setPoint(touch, kOffsetKey, CGPointZero);
+                    aa_setPoint(touch, kPrevOffsetKey, CGPointZero);
+                    aa_setPoint(touch, kPrevFilteredKey, raw);
+                    continue;
+                }
 
-                // ── EMA 滤波 + 中心拉力 ──
-                CGPoint filtered = [mgr processTouchMovement:raw previousPoint:prev];
+                // ── 移位：当前偏移 → 上一帧偏移 ──
+                CGPoint prevOffset = aa_getPoint(touch, kOffsetKey);
+                aa_setPoint(touch, kPrevOffsetKey, prevOffset);
 
-                // ── 存储当前滤波值供下一帧使用 ──
-                objc_setAssociatedObject(touch, kPrevFilteredKey,
-                    [NSValue valueWithCGPoint:filtered],
-                    OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                // ── EMA 滤波 ──
+                CGPoint prevFiltered = aa_getPoint(touch, kPrevFilteredKey);
+                if (CGPointEqualToPoint(prevFiltered, CGPointZero)) prevFiltered = raw;
 
-                // ── 覆写 UITouch 内部 ivar ──
-                // _locationInWindow ← 滤波后坐标
-                // _previousLocationInWindow ← 上一帧滤波后坐标
-                // 这样 locationInView: / previousLocationInView: / _locationInWindow
-                // 等所有方法都会自动返回滤波后的值
+                CGPoint filtered = [mgr processTouchMovement:raw previousPoint:prevFiltered];
+
+                aa_setPoint(touch, kPrevFilteredKey, filtered);
+
+                // ── 计算偏移量 = filtered - raw ──
+                CGPoint offset = CGPointMake(filtered.x - raw.x, filtered.y - raw.y);
+                aa_setPoint(touch, kOffsetKey, offset);
+
+                // ── 路径B：同时修改 ivar（不依赖 offset >= 0） ──
                 aa_writeIvar(touch, g_locOffset, filtered);
-                aa_writeIvar(touch, g_prevLocOffset, prev);
+                aa_writeIvar(touch, g_prevLocOffset, prevFiltered);
             }
+
+            g_isProcessing = NO;
         }
     }
 
     %orig;
+}
+
+%end
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  UITouch 方法Hook — 路径A
+//  覆盖所有公开/精确变体，确保任何调用路径都返回滤波值
+// ═══════════════════════════════════════════════════════════════════════════
+%hook UITouch
+
+// ── locationInView: ──
+- (CGPoint)locationInView:(UIView *)view {
+    if (g_isProcessing || self.phase != UITouchPhaseMoved) {
+        return %orig(view);
+    }
+    CGPoint raw = %orig(view);
+    CGPoint offset = aa_getPoint(self, kOffsetKey);
+    if (CGPointEqualToPoint(offset, CGPointZero)) return raw;
+    return CGPointMake(raw.x + offset.x, raw.y + offset.y);
+}
+
+// ── previousLocationInView: ──
+- (CGPoint)previousLocationInView:(UIView *)view {
+    if (g_isProcessing || self.phase != UITouchPhaseMoved) {
+        return %orig(view);
+    }
+    CGPoint rawPrev = %orig(view);
+    CGPoint prevOffset = aa_getPoint(self, kPrevOffsetKey);
+    if (CGPointEqualToPoint(prevOffset, CGPointZero)) return rawPrev;
+    return CGPointMake(rawPrev.x + prevOffset.x, rawPrev.y + prevOffset.y);
+}
+
+// ── preciseLocationInView: (iOS 9.1+) ──
+- (CGPoint)preciseLocationInView:(UIView *)view {
+    if (g_isProcessing || self.phase != UITouchPhaseMoved) {
+        return %orig(view);
+    }
+    CGPoint raw = %orig(view);
+    CGPoint offset = aa_getPoint(self, kOffsetKey);
+    if (CGPointEqualToPoint(offset, CGPointZero)) return raw;
+    return CGPointMake(raw.x + offset.x, raw.y + offset.y);
+}
+
+// ── precisePreviousLocationInView: (iOS 9.1+) ──
+- (CGPoint)precisePreviousLocationInView:(UIView *)view {
+    if (g_isProcessing || self.phase != UITouchPhaseMoved) {
+        return %orig(view);
+    }
+    CGPoint rawPrev = %orig(view);
+    CGPoint prevOffset = aa_getPoint(self, kPrevOffsetKey);
+    if (CGPointEqualToPoint(prevOffset, CGPointZero)) return rawPrev;
+    return CGPointMake(rawPrev.x + prevOffset.x, rawPrev.y + prevOffset.y);
 }
 
 %end

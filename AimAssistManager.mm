@@ -22,12 +22,12 @@ static NSString *const kHeadshotSnapRadiusKey = @"AimAssist_HeadshotSnapRadius";
     self = [super init];
     if (self) {
         _enabled            = YES;
-        _strength           = 0.6f;           // 60%
+        _strength           = 0.6f;           // 60% 平滑
         _smoothingFactor    = 0.21f;          // strength * 0.35
         _fovEnabled         = YES;
         _fovRadius          = 200.0f;
         _snapToCenter       = YES;
-        _centerPullStrength = 0.5f;           // 50%
+        _centerPullStrength = 0.5f;           // 50% 磁吸
         _headshotMode       = NO;
         _headshotSnapRadius = 30.0f;
     }
@@ -76,12 +76,19 @@ static NSString *const kHeadshotSnapRadiusKey = @"AimAssist_HeadshotSnapRadius";
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  核心滤波算法 — 自然手感 + 可感知辅助
+//  核心滤波算法
 //
-//  参数映射（strength=0.6, centerPull=0.5 为例）：
-//    EMA factor:   0.21 基础 → FOV 内最高 0.36（64%~79% 移动量通过）
-//    中心拉力:     FOV 外 2.5% → FOV 内最高 6% → 头击区 12%
-//    硬上限:       平滑 ≤50%，拉力 ≤15%
+//  1. EMA 平滑：减少触摸抖动，factor 越高越平滑
+//     factor = strength * 0.35 + FOV增强(最多+0.15)，上限 0.50
+//     → 至少 50% 的移动量直接通过，手感自然
+//
+//  2. 中心拉力：将准星拉向屏幕中心
+//     FOV 外：centerPull * 0.05（2.5%@50%设置）
+//     FOV 内：centerPull * (0.05 + influence * 0.15)（5%~12.5%@50%设置）
+//     头击区：×2（最高 25%）
+//     硬上限：25%
+//
+//  3. influence = 1 - dist/fovRadius（越靠近中心越强）
 // ═══════════════════════════════════════════════════════════════════════════
 - (CGPoint)processTouchMovement:(CGPoint)raw previousPoint:(CGPoint)prev {
     if (!_enabled || _strength <= 0.0f) return raw;
@@ -91,36 +98,35 @@ static NSString *const kHeadshotSnapRadiusKey = @"AimAssist_HeadshotSnapRadius";
     float cy = screen.height * 0.5f;
     float dist = sqrtf((raw.x - cx) * (raw.x - cx) + (raw.y - cy) * (raw.y - cy));
 
-    // ── 1. 基础 EMA 平滑 ──
+    // ── 1. EMA 平滑 ──
     float factor = _smoothingFactor;
 
-    // ── 2. FOV 内增强平滑 ──
     BOOL inFov = _fovEnabled && (dist < _fovRadius);
     if (inFov) {
-        float influence = 1.0f - (dist / _fovRadius);  // 0~1
-        factor += influence * 0.15f;                    // 最多 +15%
+        float influence = 1.0f - (dist / _fovRadius);
+        factor += influence * 0.15f;
     }
-    factor = fminf(factor, 0.50f);  // 硬上限 50%
+    factor = fminf(factor, 0.50f);
 
     float x = prev.x + (raw.x - prev.x) * (1.0f - factor);
     float y = prev.y + (raw.y - prev.y) * (1.0f - factor);
 
-    // ── 3. 中心拉力 ──
+    // ── 2. 中心拉力 ──
     if (_snapToCenter && _centerPullStrength > 0.0f) {
         float pull;
+
         if (inFov) {
             float influence = 1.0f - (dist / _fovRadius);
-            pull = _centerPullStrength * (0.03f + influence * 0.09f);  // 1.5%~6%
+            pull = _centerPullStrength * (0.05f + influence * 0.15f);
         } else {
-            pull = _centerPullStrength * 0.05f;  // FOV 外 2.5%
+            pull = _centerPullStrength * 0.05f;
         }
 
-        // 头击模式：锁定区附近拉力翻倍
         if (_headshotMode && dist < _headshotSnapRadius * 3.0f) {
-            pull *= 2.0f;  // 最多 12%
+            pull *= 2.0f;
         }
 
-        pull = fminf(pull, 0.15f);  // 硬上限 15%
+        pull = fminf(pull, 0.25f);
 
         x += (cx - x) * pull;
         y += (cy - y) * pull;
