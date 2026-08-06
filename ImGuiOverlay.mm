@@ -16,23 +16,32 @@
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (self) {
-        self.userInteractionEnabled = NO;  // 关键：不接收任何触摸
+        self.userInteractionEnabled = NO;
     }
     return self;
 }
 @end
 
 // ═══════════════════════════════════════════════════════════════════
-//  窗口2: 触摸控制窗口（仅面板大小，自然透传）
-//  - frame 精确匹配 ImGui 面板区域
-//  - 面板外触摸 → iOS 自动检查下一个窗口（游戏窗口）
-//  - 面板内触摸 → 转发给 ImGui
+//  窗口2: 触摸窗口（全屏，hitTest 智能拦截）
+//  - 全屏 frame：确保拖拽时触摸事件持续送达
+//  - hitTest 返回 self 仅当触摸在面板内 → 转发给 ImGui
+//  - 面板外 → 返回 nil → 穿透到游戏
 // ═══════════════════════════════════════════════════════════════════
 @interface ImGuiTouchWindow : UIWindow
+@property (nonatomic, assign) CGRect panelRect;  // 由 ImGuiOverlay 每帧更新
 @end
 @implementation ImGuiTouchWindow
 
-// 面板内触摸 → 转发给 ImGui
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    // 仅面板内触摸由本窗口拦截
+    if (CGRectContainsPoint(_panelRect, point)) {
+        return self;
+    }
+    return nil;  // 面板外 → 穿透
+}
+
+// 转发触摸事件到 ImGui
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     [self feedImGuiTouches:touches];
 }
@@ -51,10 +60,7 @@
     if (!ctx) return;
     ImGuiIO &io = ImGui::GetIO();
     for (UITouch *touch in touches) {
-        // 触摸窗口坐标 → 屏幕坐标（加上窗口偏移）
         CGPoint loc = [touch locationInView:self];
-        loc.x += self.frame.origin.x;
-        loc.y += self.frame.origin.y;
         io.AddMousePosEvent(loc.x, loc.y);
         if (touch.phase == UITouchPhaseBegan) {
             io.AddMouseButtonEvent(0, true);
@@ -79,7 +85,7 @@
     id<MTLCommandQueue> _commandQueue;
     MTKView            *_mtkView;
     ImGuiFovWindow     *_fovWindow;      // 全屏渲染窗口（无触摸）
-    ImGuiTouchWindow   *_touchWindow;    // 面板触摸窗口（仅面板区域）
+    ImGuiTouchWindow   *_touchWindow;    // 全屏触摸窗口（智能拦截）
     CADisplayLink      *_displayLink;
     BOOL                _showUI;
     float               _fovRadius;
@@ -134,7 +140,7 @@
         _mtkView.clearColor     = MTLClearColorMake(0, 0, 0, 0);
         _mtkView.backgroundColor = [UIColor clearColor];
         _mtkView.opaque         = NO;
-        _mtkView.userInteractionEnabled = NO;  // MTKView 也不接收触摸
+        _mtkView.userInteractionEnabled = NO;
         _mtkView.enableSetNeedsDisplay = NO;
         _mtkView.paused = NO;
 
@@ -146,15 +152,15 @@
         _fovWindow.backgroundColor   = [UIColor clearColor];
         _fovWindow.opaque            = NO;
         _fovWindow.hidden            = NO;
-        // userInteractionEnabled = NO 在 ImGuiFovWindow 中已设置
 
-        // ── 窗口2: 触摸窗口（初始隐藏，渲染后更新位置和大小） ──
-        _touchWindow = [[ImGuiTouchWindow alloc] initWithFrame:CGRectZero];
-        _touchWindow.windowLevel     = UIWindowLevelAlert + 101;  // 比渲染窗口高1级
-        _touchWindow.backgroundColor = [UIColor clearColor];
-        _touchWindow.opaque          = NO;
-        _touchWindow.clipsToBounds   = YES;
-        _touchWindow.hidden          = NO;
+        // ── 窗口2: 触摸窗口（全屏，智能 hitTest） ──
+        _touchWindow = [[ImGuiTouchWindow alloc] initWithFrame:screenBounds];
+        _touchWindow.windowLevel       = UIWindowLevelAlert + 101;  // 比渲染窗口高
+        _touchWindow.backgroundColor   = [UIColor clearColor];
+        _touchWindow.opaque            = NO;
+        _touchWindow.panelRect         = CGRectZero;  // 初始空，渲染后更新
+        _touchWindow.rootViewController = [[UIViewController alloc] init];
+        _touchWindow.hidden            = NO;
 
         // ── ImGui 初始化 ──
         IMGUI_CHECKVERSION();
@@ -179,7 +185,6 @@
         style.WindowPadding   = ImVec2(16, 14);
         style.FramePadding    = ImVec2(10, 8);
 
-        // 超大字体
         ImFontConfig fontConfig;
         fontConfig.SizePixels = 28.0f;
         io.Fonts->AddFontDefault(&fontConfig);
@@ -227,10 +232,8 @@
     // ── 绘制控制面板 ──
     [self drawUI];
 
-    // ── 更新触摸窗口 frame 精确匹配面板位置 ──
-    if (_panelWidth > 0 && _panelHeight > 0) {
-        _touchWindow.frame = CGRectMake(_panelPosX, _panelPosY, _panelWidth, _panelHeight);
-    }
+    // ── 更新触摸窗口的 panelRect（供 hitTest 精确判断） ──
+    _touchWindow.panelRect = CGRectMake(_panelPosX, _panelPosY, _panelWidth, _panelHeight);
 
     ImGui::Render();
 
@@ -316,7 +319,7 @@
     }
 }
 
-#pragma mark - 控制面板（带头击模式）
+#pragma mark - 控制面板
 
 - (void)drawUI {
     AimAssistManager *mgr = [AimAssistManager sharedManager];
@@ -325,6 +328,7 @@
     float panelW = fminf(560, screen.width - 20);
     float panelH = 680;
 
+    // 初始位置：屏幕右侧，允许用户自由拖拽到全屏任意位置
     ImVec2 winPos = ImVec2(screen.width - panelW - 10, 40);
     ImVec2 winSize = ImVec2(panelW, panelH);
 
@@ -332,12 +336,12 @@
     ImGui::SetNextWindowSize(winSize, ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowBgAlpha(0.80f);
 
+    // 允许自由拖拽移动
     ImGui::Begin("AimAssist", &_showUI,
-                 ImGuiWindowFlags_NoTitleBar |
                  ImGuiWindowFlags_NoResize |
                  ImGuiWindowFlags_AlwaysAutoResize);
 
-    // ── 记录面板位置 ──
+    // ── 记录面板位置（用于触摸窗口 hitTest） ──
     ImVec2 pos = ImGui::GetWindowPos();
     ImVec2 size = ImGui::GetWindowSize();
     _panelPosX = pos.x;
@@ -345,10 +349,10 @@
     _panelWidth = size.x;
     _panelHeight = size.y;
 
-    // ── 标题 ──
+    // ── 标题栏（可拖拽） ──
     ImGui::TextColored(ImVec4(0.0f, 0.8f, 1.0f, 1.0f), "AIM ASSIST");
     ImGui::SameLine();
-    ImGui::TextDisabled("v2.1");
+    ImGui::TextDisabled("v2.2");
     ImGui::Separator();
     ImGui::Spacing();
 
@@ -412,7 +416,7 @@
     }
     ImGui::Spacing();
 
-    // ── 5. 头击模式（HEADSHOT MODE） ──
+    // ── 5. 头击模式 ──
     ImGui::Separator();
     ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 0.9f), "HEADSHOT MODE");
     ImGui::Spacing();
@@ -464,8 +468,8 @@
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
-    ImGui::TextDisabled("Touch outside panel = auto passes through");
-    ImGui::TextDisabled("Drag panel title to reposition");
+    ImGui::TextDisabled("Drag title bar to move anywhere on screen");
+    ImGui::TextDisabled("Touch outside panel = passes through to game");
 
     ImGui::End();
 }
