@@ -6,53 +6,44 @@
 #import <MetalKit/MetalKit.h>
 
 // ═══════════════════════════════════════════════════════════════════
-//  窗口1: 渲染窗口（全屏，彻底禁用触摸交互）
-//  - 负责绘制 FOV 圈 + ImGui 面板
-//  - userInteractionEnabled = NO → iOS 完全跳过此窗口的触摸检测
+//  单窗口：渲染 + 触摸统一处理
+//  - 全屏，负责绘制 FOV 圈 + ImGui 面板
+//  - hitTest 智能拦截：面板内触摸 → 自己处理，面板外 → 穿透到游戏
+//  - sendEvent 可靠拦截所有触摸事件转发给 ImGui
 // ═══════════════════════════════════════════════════════════════════
-@interface ImGuiFovWindow : UIWindow
-@end
-@implementation ImGuiFovWindow
-- (instancetype)initWithFrame:(CGRect)frame {
-    self = [super initWithFrame:frame];
-    if (self) {
-        self.userInteractionEnabled = NO;
-    }
-    return self;
-}
-@end
-
-// ═══════════════════════════════════════════════════════════════════
-//  窗口2: 触摸窗口（全屏，hitTest 智能拦截）
-//  - 全屏 frame：确保拖拽时触摸事件持续送达
-//  - hitTest 返回 self 仅当触摸在面板内 → 转发给 ImGui
-//  - 面板外 → 返回 nil → 穿透到游戏
-// ═══════════════════════════════════════════════════════════════════
-@interface ImGuiTouchWindow : UIWindow
+@interface ImGuiOverlayWindow : UIWindow
 @property (nonatomic, assign) CGRect panelRect;  // 由 ImGuiOverlay 每帧更新
 @end
-@implementation ImGuiTouchWindow
+@implementation ImGuiOverlayWindow
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     // 仅面板内触摸由本窗口拦截
     if (CGRectContainsPoint(_panelRect, point)) {
         return self;
     }
-    return nil;  // 面板外 → 穿透
+    return nil;  // 面板外 → 穿透到游戏
 }
 
-// 转发触摸事件到 ImGui
-- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    [self feedImGuiTouches:touches];
-}
-- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    [self feedImGuiTouches:touches];
-}
-- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    [self feedImGuiTouches:touches];
-}
-- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    [self feedImGuiTouches:touches];
+// ═══════════════════════════════════════════════════════════════════
+//  sendEvent: 是 iOS 触摸事件传递的可靠入口
+//  UIApplication 将事件发送到最前窗口的 sendEvent:
+//  比 touchesBegan: 更可靠，因为窗口没有子视图时 touches 可能不被调用
+// ═══════════════════════════════════════════════════════════════════
+- (void)sendEvent:(UIEvent *)event {
+    if (event.type == UIEventTypeTouches) {
+        // 检查触摸点是否在面板内
+        UITouch *anyTouch = [event.allTouches anyObject];
+        if (anyTouch) {
+            CGPoint loc = [anyTouch locationInView:self];
+            if (CGRectContainsPoint(_panelRect, loc)) {
+                // 面板内触摸 → 转发给 ImGui，不调用 super（阻止事件传递到游戏）
+                [self feedImGuiTouches:event.allTouches];
+                return;
+            }
+        }
+    }
+    // 面板外触摸 → 调用 super 让事件传递到游戏窗口
+    [super sendEvent:event];
 }
 
 - (void)feedImGuiTouches:(NSSet<UITouch *> *)touches {
@@ -81,19 +72,18 @@
 @end
 
 @implementation ImGuiOverlay {
-    id<MTLDevice>       _device;
-    id<MTLCommandQueue> _commandQueue;
-    MTKView            *_mtkView;
-    ImGuiFovWindow     *_fovWindow;      // 全屏渲染窗口（无触摸）
-    ImGuiTouchWindow   *_touchWindow;    // 全屏触摸窗口（智能拦截）
-    CADisplayLink      *_displayLink;
-    BOOL                _showUI;
-    float               _fovRadius;
-    float               _panelPosX;
-    float               _panelPosY;
-    float               _panelWidth;
-    float               _panelHeight;
-    float               _animTime;
+    id<MTLDevice>           _device;
+    id<MTLCommandQueue>     _commandQueue;
+    MTKView                *_mtkView;
+    ImGuiOverlayWindow     *_overlayWindow;   // 统一窗口
+    CADisplayLink          *_displayLink;
+    BOOL                    _showUI;
+    float                   _fovRadius;
+    float                   _panelPosX;
+    float                   _panelPosY;
+    float                   _panelWidth;
+    float                   _panelHeight;
+    float                   _animTime;
 }
 
 + (instancetype)sharedOverlay {
@@ -134,7 +124,7 @@
 
         CGRect screenBounds = [UIScreen mainScreen].bounds;
 
-        // ── 创建 MTKView（全屏渲染） ──
+        // ── 创建 MTKView（全屏渲染，禁用触摸以免干扰窗口触摸处理） ──
         _mtkView = [[MTKView alloc] initWithFrame:screenBounds device:_device];
         _mtkView.delegate       = self;
         _mtkView.clearColor     = MTLClearColorMake(0, 0, 0, 0);
@@ -143,24 +133,21 @@
         _mtkView.userInteractionEnabled = NO;
         _mtkView.enableSetNeedsDisplay = NO;
         _mtkView.paused = NO;
+        _mtkView.autoresizingMask = UIViewAutoresizingFlexibleWidth |
+                                     UIViewAutoresizingFlexibleHeight;
 
-        // ── 窗口1: 渲染窗口（全屏，无触摸） ──
-        _fovWindow = [[ImGuiFovWindow alloc] initWithFrame:screenBounds];
-        _fovWindow.windowLevel       = UIWindowLevelAlert + 100;
-        _fovWindow.rootViewController = [[UIViewController alloc] init];
-        _fovWindow.rootViewController.view = _mtkView;
-        _fovWindow.backgroundColor   = [UIColor clearColor];
-        _fovWindow.opaque            = NO;
-        _fovWindow.hidden            = NO;
+        // ── 创建统一窗口（全屏，处理渲染 + 触摸） ──
+        _overlayWindow = [[ImGuiOverlayWindow alloc] initWithFrame:screenBounds];
+        _overlayWindow.windowLevel       = UIWindowLevelAlert + 100;
+        _overlayWindow.backgroundColor   = [UIColor clearColor];
+        _overlayWindow.opaque            = NO;
+        _overlayWindow.panelRect         = CGRectZero;
+        _overlayWindow.hidden            = NO;
 
-        // ── 窗口2: 触摸窗口（全屏，智能 hitTest） ──
-        _touchWindow = [[ImGuiTouchWindow alloc] initWithFrame:screenBounds];
-        _touchWindow.windowLevel       = UIWindowLevelAlert + 101;  // 比渲染窗口高
-        _touchWindow.backgroundColor   = [UIColor clearColor];
-        _touchWindow.opaque            = NO;
-        _touchWindow.panelRect         = CGRectZero;  // 初始空，渲染后更新
-        _touchWindow.rootViewController = [[UIViewController alloc] init];
-        _touchWindow.hidden            = NO;
+        // ── 将 MTKView 添加到窗口 ──
+        // 注意：不设置 rootViewController，避免 view controller 对 MTKView 做额外布局裁剪
+        // 直接将 MTKView 作为 subview 添加到窗口，确保它始终全屏
+        [_overlayWindow addSubview:_mtkView];
 
         // ── ImGui 初始化 ──
         IMGUI_CHECKVERSION();
@@ -210,13 +197,18 @@
 
 #pragma mark - MTKViewDelegate
 
-- (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {}
+- (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {
+    // 当 drawable 尺寸变化时，更新 ImGui 显示尺寸
+    ImGuiIO &io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(view.bounds.size.width, view.bounds.size.height);
+}
 
 - (void)drawInMTKView:(MTKView *)view {
     if (!_initialized || !_showUI) return;
 
+    CGSize viewSize = view.bounds.size;
     ImGuiIO &io = ImGui::GetIO();
-    io.DisplaySize = ImVec2(view.bounds.size.width, view.bounds.size.height);
+    io.DisplaySize = ImVec2(viewSize.width, viewSize.height);
 
     _fovRadius = [[AimAssistManager sharedManager] fovRadius];
 
@@ -232,8 +224,9 @@
     // ── 绘制控制面板 ──
     [self drawUI];
 
-    // ── 更新触摸窗口的 panelRect（供 hitTest 精确判断） ──
-    _touchWindow.panelRect = CGRectMake(_panelPosX, _panelPosY, _panelWidth, _panelHeight);
+    // ── 更新窗口的 panelRect（供 hitTest 精确判断） ──
+    _overlayWindow.panelRect = CGRectMake(_panelPosX, _panelPosY,
+                                          _panelWidth, _panelHeight);
 
     ImGui::Render();
 
@@ -341,7 +334,7 @@
                  ImGuiWindowFlags_NoResize |
                  ImGuiWindowFlags_AlwaysAutoResize);
 
-    // ── 记录面板位置（用于触摸窗口 hitTest） ──
+    // ── 记录面板位置（用于窗口 hitTest 判断） ──
     ImVec2 pos = ImGui::GetWindowPos();
     ImVec2 size = ImGui::GetWindowSize();
     _panelPosX = pos.x;
@@ -352,7 +345,7 @@
     // ── 标题栏（可拖拽） ──
     ImGui::TextColored(ImVec4(0.0f, 0.8f, 1.0f, 1.0f), "AIM ASSIST");
     ImGui::SameLine();
-    ImGui::TextDisabled("v2.2");
+    ImGui::TextDisabled("v2.3");
     ImGui::Separator();
     ImGui::Spacing();
 
@@ -480,8 +473,7 @@
     dispatch_async(dispatch_get_main_queue(), ^{
         [self setupMetalAndImGui];
         if (!_initialized) return;
-        self->_fovWindow.hidden = NO;
-        self->_touchWindow.hidden = NO;
+        self->_overlayWindow.hidden = NO;
         self->_showUI = YES;
     });
 }
@@ -489,13 +481,12 @@
 - (void)hide {
     dispatch_async(dispatch_get_main_queue(), ^{
         self->_showUI = NO;
-        self->_fovWindow.hidden = YES;
-        self->_touchWindow.hidden = YES;
+        self->_overlayWindow.hidden = YES;
     });
 }
 
 - (BOOL)isVisible {
-    return !_fovWindow.hidden;
+    return !_overlayWindow.hidden;
 }
 
 @end
