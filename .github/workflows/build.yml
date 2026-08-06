@@ -18,7 +18,11 @@ jobs:
       - name: Install Toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld ldid fakeroot dpkg-dev perl curl
+          sudo apt-get install -y clang lld fakeroot dpkg-dev perl curl git make
+          # Install ldid for iOS code signing
+          sudo curl -fsSL -o /usr/local/bin/ldid https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_linux_x86_64
+          sudo chmod +x /usr/local/bin/ldid
+          ldid --version || echo "ldid installed"
 
       - name: Setup Theos
         run: |
