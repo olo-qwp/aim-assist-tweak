@@ -18,33 +18,11 @@
 
 @synthesize imguiPanelRect = _imguiPanelRect;
 
-/// 获取当前所有 UIWindow（iOS 15+ 兼容方法）
-+ (NSArray<UIWindow *> *)allWindows {
-    NSMutableArray<UIWindow *> *result = [NSMutableArray array];
-    if (@available(iOS 15.0, *)) {
-        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-            if ([scene isKindOfClass:[UIWindowScene class]]) {
-                UIWindowScene *ws = (UIWindowScene *)scene;
-                [result addObjectsFromArray:ws.windows];
-            }
-        }
-    } else {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        [result addObjectsFromArray:[UIApplication sharedApplication].windows];
-#pragma clang diagnostic pop
-    }
-    return result;
-}
-
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    // ── 第1步：判断触摸点是否在 ImGui 面板矩形内 ──
-    BOOL insidePanel = CGRectContainsPoint(_imguiPanelRect, point);
-
-    if (!insidePanel) {
-        // ── 完全在面板外 → 直接穿透到游戏 ──
-        // 不调用 super hitTest，不返回任何本窗口的 view
-        return [self hitTestForwardToGame:point withEvent:event];
+    // ── 判断触摸点是否在 ImGui 面板矩形内 ──
+    if (!CGRectContainsPoint(_imguiPanelRect, point)) {
+        // ── 完全在面板外 → 返回 nil，让 iOS 自动检查下一个窗口（游戏窗口） ──
+        return nil;
     }
 
     // ── 在面板内 → 检查 ImGui 是否需要捕获 ──
@@ -52,26 +30,12 @@
     if (ctx) {
         ImGuiIO &io = ImGui::GetIO();
         if (io.WantCaptureMouse || io.WantCaptureKeyboard) {
-            // ImGui 需要捕获 → 返回正常的 hitTest 结果
+            // ImGui 需要捕获 → 返回正常的 hitTest 结果（MTKView）
             return [super hitTest:point withEvent:event];
         }
     }
 
-    // ── ImGui 不需要捕获 → 穿透到游戏 ──
-    return [self hitTestForwardToGame:point withEvent:event];
-}
-
-/// 将触摸转发到游戏窗口
-- (UIView *)hitTestForwardToGame:(CGPoint)point withEvent:(UIEvent *)event {
-    NSArray<UIWindow *> *windows = [self.class allWindows];
-    // 从最上层开始遍历，找到本窗口之下的游戏窗口
-    for (NSInteger i = windows.count - 1; i >= 0; i--) {
-        UIWindow *w = windows[i];
-        if (w == self || w.hidden || !w.userInteractionEnabled) continue;
-        if (w.windowLevel >= self.windowLevel) continue;
-        UIView *gameHit = [w hitTest:point withEvent:event];
-        if (gameHit) return gameHit;
-    }
+    // ── 在面板内但 ImGui 不需要捕获 → 也穿透到游戏 ──
     return nil;
 }
 
