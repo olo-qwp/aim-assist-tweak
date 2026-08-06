@@ -38,19 +38,6 @@ jobs:
           sudo mv /tmp/ldid /usr/local/bin/ldid 2>/dev/null || true
           which ldid && ldid --version || echo "ldid installed"
 
-      - name: Download ImGui
-        run: |
-          IMGUI_VER="v1.91.0"
-          curl -fsSL "https://github.com/ocornut/imgui/archive/refs/tags/${IMGUI_VER}.tar.gz" | tar xz
-          mkdir -p ImGui
-          cp imgui-1.91.0/*.h ImGui/
-          cp imgui-1.91.0/*.cpp ImGui/
-          cp imgui-1.91.0/backends/imgui_impl_metal.h ImGui/
-          cp imgui-1.91.0/backends/imgui_impl_metal.mm ImGui/
-          rm -rf imgui-1.91.0
-          echo "ImGui files downloaded:"
-          ls -la ImGui/
-
       - name: Build Package
         run: |
           make package FINALPACKAGE=1

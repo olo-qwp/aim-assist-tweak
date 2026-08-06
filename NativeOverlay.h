@@ -1,6 +1,6 @@
 #import <UIKit/UIKit.h>
 
-@interface ImGuiOverlay : NSObject
+@interface NativeOverlay : NSObject
 
 + (instancetype)sharedOverlay;
 - (void)show;
