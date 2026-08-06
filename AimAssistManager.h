@@ -11,6 +11,10 @@
 @property (nonatomic, assign) BOOL snapToCenter;        // FOV 内磁吸吸附开关
 @property (nonatomic, assign) float centerPullStrength; // 中心拉力强度 0.0 - 1.0
 
+// 头击模式（Headshot Mode）
+@property (nonatomic, assign) BOOL headshotMode;        // 头击模式开关
+@property (nonatomic, assign) float headshotSnapRadius; // 头击锁定半径 (pts)，触摸进入此区域直接拉到中心
+
 + (instancetype)sharedManager;
 - (void)loadSettings;
 - (void)saveSettings;

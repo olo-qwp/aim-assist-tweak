@@ -1,11 +1,13 @@
 #import "AimAssistManager.h"
 
-static NSString *const kEnabledKey          = @"AimAssist_Enabled";
-static NSString *const kStrengthKey         = @"AimAssist_Strength";
-static NSString *const kFovEnabledKey       = @"AimAssist_FovEnabled";
-static NSString *const kFovRadiusKey        = @"AimAssist_FovRadius";
-static NSString *const kSnapToCenterKey     = @"AimAssist_SnapToCenter";
+static NSString *const kEnabledKey            = @"AimAssist_Enabled";
+static NSString *const kStrengthKey           = @"AimAssist_Strength";
+static NSString *const kFovEnabledKey         = @"AimAssist_FovEnabled";
+static NSString *const kFovRadiusKey          = @"AimAssist_FovRadius";
+static NSString *const kSnapToCenterKey       = @"AimAssist_SnapToCenter";
 static NSString *const kCenterPullStrengthKey = @"AimAssist_CenterPullStrength";
+static NSString *const kHeadshotModeKey       = @"AimAssist_HeadshotMode";
+static NSString *const kHeadshotSnapRadiusKey = @"AimAssist_HeadshotSnapRadius";
 
 @implementation AimAssistManager
 
@@ -28,6 +30,8 @@ static NSString *const kCenterPullStrengthKey = @"AimAssist_CenterPullStrength";
         _fovRadius          = 150.0f;
         _snapToCenter       = YES;
         _centerPullStrength = 0.4f;
+        _headshotMode       = NO;
+        _headshotSnapRadius = 30.0f;
     }
     return self;
 }
@@ -52,6 +56,12 @@ static NSString *const kCenterPullStrengthKey = @"AimAssist_CenterPullStrength";
     if ([defaults objectForKey:kCenterPullStrengthKey]) {
         _centerPullStrength = [defaults floatForKey:kCenterPullStrengthKey];
     }
+    if ([defaults objectForKey:kHeadshotModeKey]) {
+        _headshotMode = [defaults boolForKey:kHeadshotModeKey];
+    }
+    if ([defaults objectForKey:kHeadshotSnapRadiusKey]) {
+        _headshotSnapRadius = [defaults floatForKey:kHeadshotSnapRadiusKey];
+    }
     _smoothingFactor = _strength * 0.88f;
 }
 
@@ -63,7 +73,11 @@ static NSString *const kCenterPullStrengthKey = @"AimAssist_CenterPullStrength";
     [defaults setFloat:_fovRadius forKey:kFovRadiusKey];
     [defaults setBool:_snapToCenter forKey:kSnapToCenterKey];
     [defaults setFloat:_centerPullStrength forKey:kCenterPullStrengthKey];
+    [defaults setBool:_headshotMode forKey:kHeadshotModeKey];
+    [defaults setFloat:_headshotSnapRadius forKey:kHeadshotSnapRadiusKey];
     [defaults synchronize];
+    // 更新平滑系数
+    _smoothingFactor = _strength * 0.88f;
 }
 
 - (float)distanceFromCenter:(CGPoint)point {
@@ -75,7 +89,6 @@ static NSString *const kCenterPullStrengthKey = @"AimAssist_CenterPullStrength";
     return sqrtf(dx * dx + dy * dy);
 }
 
-/// 将触摸点向屏幕中心磁吸拉拽
 - (CGPoint)snapTowardCenter:(CGPoint)point strength:(float)pullStrength {
     CGSize screen = [UIScreen mainScreen].bounds.size;
     CGFloat cx = screen.width * 0.5f;
@@ -84,7 +97,6 @@ static NSString *const kCenterPullStrengthKey = @"AimAssist_CenterPullStrength";
     CGFloat dx = cx - point.x;
     CGFloat dy = cy - point.y;
 
-    // pullStrength 0~1，控制拉拽比例
     CGFloat pulledX = point.x + dx * pullStrength;
     CGFloat pulledY = point.y + dy * pullStrength;
 
@@ -96,34 +108,72 @@ static NSString *const kCenterPullStrengthKey = @"AimAssist_CenterPullStrength";
         return currentPoint;
     }
 
-    // ── 1. 基础 EMA 平滑 ──
+    CGSize screen = [UIScreen mainScreen].bounds.size;
+    CGFloat cx = screen.width * 0.5f;
+    CGFloat cy = screen.height * 0.5f;
+    CGFloat dist = [self distanceFromCenter:currentPoint];
+
+    // ═══════════════════════════════════════════════════════════════
+    //  头击模式：锁定区 → 直接拉到中心
+    // ═══════════════════════════════════════════════════════════════
+    if (_headshotMode && dist < _headshotSnapRadius) {
+        // 进入锁定区 → 直接吸附到中心（模拟瞄头）
+        return CGPointMake(cx, cy);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  基础 EMA 平滑
+    // ═══════════════════════════════════════════════════════════════
     float factor = _smoothingFactor;
     float x = previousPoint.x + (currentPoint.x - previousPoint.x) * (1.0f - factor);
     float y = previousPoint.y + (currentPoint.y - previousPoint.y) * (1.0f - factor);
 
-    // ── 2. FOV 增强 ──
-    float dist = [self distanceFromCenter:currentPoint];
+    // ═══════════════════════════════════════════════════════════════
+    //  FOV 增强
+    // ═══════════════════════════════════════════════════════════════
     BOOL insideFov = _fovEnabled && (dist < _fovRadius);
 
     if (insideFov) {
-        // FOV 内增强平滑（越靠近中心越平滑）
+        // FOV 内增强平滑
         float fovInfluence = 1.0f - (dist / _fovRadius);
         float boost = fovInfluence * 0.35f * _strength;
+        if (_headshotMode) {
+            boost *= 1.5f;  // 头击模式增强平滑效果
+        }
         float adjFactor = fminf(factor + boost, 0.95f);
 
         x = previousPoint.x + (currentPoint.x - previousPoint.x) * (1.0f - adjFactor);
         y = previousPoint.y + (currentPoint.y - previousPoint.y) * (1.0f - adjFactor);
 
-        // ── 3. 磁吸吸附：将平滑后的点向屏幕中心拉拽 ──
+        // ══════════════════════════════════════════════════════════
+        //  磁吸吸附
+        // ══════════════════════════════════════════════════════════
         if (_snapToCenter && _centerPullStrength > 0.0f) {
-            // FOV 内越靠近中心拉力越强
-            float fovFactor = 1.0f - (dist / _fovRadius);
-            float effectivePull = _centerPullStrength * fovFactor * _strength * 0.5f;
-            effectivePull = fminf(effectivePull, 0.6f);
+            float effectivePull = _centerPullStrength * fovInfluence * _strength * 0.5f;
+
+            if (_headshotMode) {
+                // 头击模式：拉力翻倍，上限提高到 0.9
+                effectivePull = fminf(effectivePull * 2.5f, 0.9f);
+            } else {
+                effectivePull = fminf(effectivePull, 0.6f);
+            }
 
             CGPoint snapped = [self snapTowardCenter:CGPointMake(x, y) strength:effectivePull];
             x = snapped.x;
             y = snapped.y;
+        }
+
+        // ══════════════════════════════════════════════════════════
+        //  头击模式：FOV 边界的磁吸引力（把触摸拉进锁定区）
+        // ══════════════════════════════════════════════════════════
+        if (_headshotMode && _snapToCenter) {
+            float postSnapDist = sqrtf((x-cx)*(x-cx) + (y-cy)*(y-cy));
+            if (postSnapDist < _headshotSnapRadius * 1.5f) {
+                // 距离锁定区边缘 1.5x 内 → 额外拉向中心
+                float extraPull = _centerPullStrength * 0.6f;
+                x += (cx - x) * extraPull;
+                y += (cy - y) * extraPull;
+            }
         }
     }
 
