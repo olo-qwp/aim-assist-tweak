@@ -5,25 +5,46 @@
 #import <Metal/Metal.h>
 #import <MetalKit/MetalKit.h>
 
-// ── 透传窗口：仅在 ImGui 需要输入时拦截触摸，否则穿透到游戏 ──
-@interface ImGuiOverlayWindow : UIWindow
+// ── 透传窗口：精确触摸热区管理 ──
+// 仅当触摸点在 ImGui 面板区域内且 ImGui 需要捕获时拦截
+// 否则全部穿透到游戏
+@interface ImGuiOverlayWindow : UIWindow {
+    CGRect _imguiPanelRect;  // 由 ImGuiOverlay 更新
+}
+@property (nonatomic, assign) CGRect imguiPanelRect;
 @end
 
 @implementation ImGuiOverlayWindow
 
+@synthesize imguiPanelRect = _imguiPanelRect;
+
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hitView = [super hitTest:point withEvent:event];
     if (hitView == self || hitView == self.subviews.firstObject) {
-        // 确保 ImGui 上下文已初始化，避免空指针崩溃
         ImGuiContext *ctx = ImGui::GetCurrentContext();
-        if (ctx && (ImGui::GetIO().WantCaptureMouse || ImGui::GetIO().WantCaptureKeyboard)) {
-            return hitView;
+        if (ctx) {
+            ImGuiIO &io = ImGui::GetIO();
+            // ── 精确热区判断：只有触摸点在 ImGui 面板矩形内才拦截 ──
+            BOOL insidePanel = CGRectContainsPoint(_imguiPanelRect, point);
+            if (insidePanel && (io.WantCaptureMouse || io.WantCaptureKeyboard)) {
+                return hitView;  // ImGui 处理
+            }
         }
-        return nil; // 穿透触摸到游戏
+        // ── 穿透到游戏：遍历所有窗口，找到最前面的游戏窗口 ──
+        NSArray<UIWindow *> *windows = [UIApplication sharedApplication].windows;
+        for (NSInteger i = windows.count - 1; i >= 0; i--) {
+            UIWindow *w = windows[i];
+            if (w == self || w.hidden || !w.userInteractionEnabled) continue;
+            if (w.windowLevel >= self.windowLevel) continue;
+            UIView *gameHit = [w hitTest:point withEvent:event];
+            if (gameHit) return gameHit;
+        }
+        return nil;
     }
     return hitView;
 }
 
+// ── 触摸事件转发到 ImGui ──
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     [self feedImGuiTouches:touches];
 }
@@ -42,7 +63,7 @@
 
 - (void)feedImGuiTouches:(NSSet<UITouch *> *)touches {
     ImGuiContext *ctx = ImGui::GetCurrentContext();
-    if (!ctx) return; // 上下文未初始化，不处理
+    if (!ctx) return;
     ImGuiIO &io = ImGui::GetIO();
     for (UITouch *touch in touches) {
         CGPoint loc = [touch locationInView:self];
@@ -60,6 +81,8 @@
 // ── ImGui 浮窗控制器 ──
 @interface ImGuiOverlay () <MTKViewDelegate>
 
+@property (nonatomic, assign) BOOL initialized;
+
 @end
 
 @implementation ImGuiOverlay {
@@ -69,7 +92,12 @@
     ImGuiOverlayWindow  *_window;
     CADisplayLink      *_displayLink;
     BOOL                _showUI;
-    BOOL                _initialized;
+    float               _fovRadius;           // 当前 FOV 半径（可调）
+    float               _panelPosX;           // 面板位置 X
+    float               _panelPosY;           // 面板位置 Y
+    float               _panelWidth;          // 面板宽度
+    float               _panelHeight;         // 面板高度
+    float               _animTime;            // 动画时间（FOV圈脉冲）
 }
 
 + (instancetype)sharedOverlay {
@@ -86,6 +114,12 @@
     if (self) {
         _showUI      = YES;
         _initialized = NO;
+        _fovRadius   = 150.0f;
+        _animTime    = 0.0f;
+        _panelPosX   = 0;
+        _panelPosY   = 0;
+        _panelWidth  = 0;
+        _panelHeight = 0;
     }
     return self;
 }
@@ -129,13 +163,26 @@
         io.DisplaySize = ImVec2(screenBounds.size.width, screenBounds.size.height);
         io.IniFilename = NULL;
 
+        // ── 自定义样式：超大尺寸 + 半透明暗色 ──
         ImGui::StyleColorsDark();
         ImGuiStyle &style = ImGui::GetStyle();
-        style.ScaleAllSizes(2.0f);
-        style.WindowRounding  = 8.0f;
-        style.FrameRounding   = 4.0f;
-        style.GrabRounding    = 4.0f;
-        style.Alpha           = 0.9f;
+        style.ScaleAllSizes(2.8f);           // 整体缩放 2.8x
+        style.WindowRounding  = 16.0f;
+        style.FrameRounding   = 8.0f;
+        style.GrabRounding    = 8.0f;
+        style.GrabMinSize     = 20.0f;
+        style.Alpha           = 0.85f;
+        style.WindowBorderSize = 1.5f;
+        style.FrameBorderSize  = 0.8f;
+        style.ItemSpacing     = ImVec2(12, 10);
+        style.ItemInnerSpacing = ImVec2(10, 6);
+        style.WindowPadding   = ImVec2(16, 14);
+        style.FramePadding    = ImVec2(10, 8);
+
+        // 超大字体
+        ImFontConfig fontConfig;
+        fontConfig.SizePixels = 28.0f;
+        io.Fonts->AddFontDefault(&fontConfig);
 
         ImGui_ImplMetal_Init(_device);
 
@@ -152,6 +199,7 @@
 
 - (void)renderLoop:(CADisplayLink *)link {
     if (!_initialized || !_mtkView) return;
+    _animTime += link.duration;
     [_mtkView draw];
 }
 
@@ -164,13 +212,23 @@
     ImGuiIO &io = ImGui::GetIO();
     io.DisplaySize = ImVec2(view.bounds.size.width, view.bounds.size.height);
 
+    // 更新 FOV 半径
+    _fovRadius = [[AimAssistManager sharedManager] fovRadius];
+
     MTLRenderPassDescriptor *rpd = view.currentRenderPassDescriptor;
     if (!rpd) return;
 
     ImGui_ImplMetal_NewFrame(rpd);
     ImGui::NewFrame();
 
+    // ── 先绘制 FOV 圈（在背景层） ──
+    [self drawFovCircle];
+
+    // ── 再绘制控制面板 ──
     [self drawUI];
+
+    // ── 更新窗口的热区矩形（供 hitTest 精确判断） ──
+    _window.imguiPanelRect = CGRectMake(_panelPosX, _panelPosY, _panelWidth, _panelHeight);
 
     ImGui::Render();
 
@@ -189,59 +247,201 @@
     }
 }
 
+// ── 增强 FOV 圈绘制（带脉冲动画） ──
+- (void)drawFovCircle {
+    AimAssistManager *mgr = [AimAssistManager sharedManager];
+    if (!mgr.fovEnabled || !mgr.enabled) return;
+
+    ImGuiIO &io = ImGui::GetIO();
+    ImDrawList *drawList = ImGui::GetBackgroundDrawList();
+
+    ImVec2 center = ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
+    float radius = _fovRadius;
+
+    // 脉冲动画：呼吸效果
+    float pulse = sinf(_animTime * 2.0f) * 0.15f + 0.85f;
+
+    // ── 外圈（脉冲透明度，亮色） ──
+    int outerAlpha = (int)(55 * pulse);
+    drawList->AddCircle(center, radius,
+                        IM_COL32(0, 200, 255, outerAlpha), 72, 2.5f);
+
+    // ── 中圈（辅助对齐） ──
+    drawList->AddCircle(center, radius * 0.6f,
+                        IM_COL32(0, 200, 255, 25), 48, 1.2f);
+
+    // ── 内圈（小范围精确瞄准区） ──
+    drawList->AddCircle(center, radius * 0.3f,
+                        IM_COL32(255, 100, 100, 35), 36, 1.0f);
+
+    // ── 中心十字准星（游戏风格） ──
+    float crossLen = 18.0f;
+    float crossGap = 5.0f;
+    ImU32 crossColor = IM_COL32(0, 255, 255, (int)(120 * pulse));
+
+    // 水平线
+    drawList->AddLine(ImVec2(center.x - crossLen - crossGap, center.y),
+                      ImVec2(center.x - crossGap, center.y), crossColor, 2.0f);
+    drawList->AddLine(ImVec2(center.x + crossGap, center.y),
+                      ImVec2(center.x + crossLen + crossGap, center.y), crossColor, 2.0f);
+    // 垂直线
+    drawList->AddLine(ImVec2(center.x, center.y - crossLen - crossGap),
+                      ImVec2(center.x, center.y - crossGap), crossColor, 2.0f);
+    drawList->AddLine(ImVec2(center.x, center.y + crossGap),
+                      ImVec2(center.x, center.y + crossLen + crossGap), crossColor, 2.0f);
+
+    // 圆心点
+    drawList->AddCircleFilled(center, 3.0f, IM_COL32(0, 255, 255, 160));
+
+    // ── 四角方向指示标记（辅助快速定位中心） ──
+    float tickLen = 8.0f;
+    ImU32 tickColor = IM_COL32(0, 200, 255, 40);
+    // 上
+    drawList->AddLine(ImVec2(center.x, center.y - radius),
+                      ImVec2(center.x, center.y - radius + tickLen), tickColor, 1.5f);
+    // 下
+    drawList->AddLine(ImVec2(center.x, center.y + radius),
+                      ImVec2(center.x, center.y + radius - tickLen), tickColor, 1.5f);
+    // 左
+    drawList->AddLine(ImVec2(center.x - radius, center.y),
+                      ImVec2(center.x - radius + tickLen, center.y), tickColor, 1.5f);
+    // 右
+    drawList->AddLine(ImVec2(center.x + radius, center.y),
+                      ImVec2(center.x + radius - tickLen, center.y), tickColor, 1.5f);
+
+    // ── 如果磁吸开启，额外显示提示文字 ──
+    if (mgr.snapToCenter) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "SNAP %.0f%%", mgr.centerPullStrength * 100.0f);
+        drawList->AddText(ImVec2(center.x - 40, center.y + radius + 12),
+                          IM_COL32(0, 255, 255, 60), buf);
+    }
+}
+
+// ── 超大控制面板（带新控件） ──
 - (void)drawUI {
     AimAssistManager *mgr = [AimAssistManager sharedManager];
 
-    ImGui::SetNextWindowPos(ImVec2(15, 120), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(300, 260), ImGuiCond_FirstUseEver);
+    CGSize screen = [UIScreen mainScreen].bounds.size;
+    float panelW = fminf(520, screen.width - 20);
+    float panelH = 620;
 
-    ImGui::Begin("Aim Assist", &_showUI,
+    // 窗口位置：右侧居中
+    ImVec2 winPos = ImVec2(screen.width - panelW - 10, 40);
+    ImVec2 winSize = ImVec2(panelW, panelH);
+
+    ImGui::SetNextWindowPos(winPos, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(winSize, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowBgAlpha(0.80f);
+
+    ImGui::Begin("AimAssist", &_showUI,
                  ImGuiWindowFlags_NoTitleBar |
-                 ImGuiWindowFlags_AlwaysAutoResize |
-                 ImGuiWindowFlags_NoResize);
+                 ImGuiWindowFlags_NoResize |
+                 ImGuiWindowFlags_AlwaysAutoResize);
 
-    ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.3f, 1.0f), "Aim Assist v1.0");
+    // ── 记录面板位置（用于精确触摸热区） ──
+    ImVec2 pos = ImGui::GetWindowPos();
+    ImVec2 size = ImGui::GetWindowSize();
+    _panelPosX = pos.x;
+    _panelPosY = pos.y;
+    _panelWidth = size.x;
+    _panelHeight = size.y;
+
+    // ── 标题栏 ──
+    ImGui::TextColored(ImVec4(0.0f, 0.8f, 1.0f, 1.0f), "AIM ASSIST");
+    ImGui::SameLine();
+    ImGui::TextDisabled("v2.0");
     ImGui::Separator();
     ImGui::Spacing();
 
-    // 开关
+    // ── 1. 主开关 ──
     BOOL enabled = mgr.enabled;
-    if (ImGui::Checkbox("Enable", &enabled)) {
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.2f, 0.2f, 0.2f, 0.6f));
+    if (ImGui::Checkbox("Enable Aim Assist", &enabled)) {
         mgr.enabled = enabled;
         [mgr saveSettings];
     }
-
+    ImGui::PopStyleColor();
     ImGui::Spacing();
 
-    // 强度滑块
+    // ── 2. 强度滑块 ──
+    ImGui::Text("Smooth Strength");
     float strength = mgr.strength * 100.0f;
-    if (ImGui::SliderFloat("Strength", &strength, 0.0f, 100.0f, "%.0f%%")) {
+    if (ImGui::SliderFloat("##Strength", &strength, 0.0f, 100.0f, "%.0f%%", ImGuiSliderFlags_None)) {
         mgr.strength = strength / 100.0f;
-        mgr.smoothingFactor = mgr.strength * 0.8f;
+        [mgr saveSettings];
+    }
+    ImGui::Spacing();
+
+    // ── 3. FOV 设置 ──
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(0.0f, 0.8f, 1.0f, 0.9f), "FOV SETTINGS");
+    ImGui::Spacing();
+
+    BOOL fovEn = mgr.fovEnabled;
+    if (ImGui::Checkbox("Show FOV Circle", &fovEn)) {
+        mgr.fovEnabled = fovEn;
         [mgr saveSettings];
     }
 
-    ImGui::Spacing();
-    ImGui::Separator();
+    float fovR = _fovRadius;
+    ImGui::Text("FOV Radius");
+    if (ImGui::SliderFloat("##FOV Radius", &fovR, 40.0f, 400.0f, "%.0f px")) {
+        _fovRadius = fovR;
+        mgr.fovRadius = fovR;
+        [mgr saveSettings];
+    }
     ImGui::Spacing();
 
-    // 状态指示
-    const char *statusText = mgr.enabled ? "Active" : "Inactive";
+    // ── 4. 磁吸吸附设置 ──
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(0.0f, 0.8f, 1.0f, 0.9f), "SNAP TO CENTER");
+    ImGui::Spacing();
+
+    BOOL snap = mgr.snapToCenter;
+    if (ImGui::Checkbox("Snap to Center", &snap)) {
+        mgr.snapToCenter = snap;
+        [mgr saveSettings];
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(magnetic pull)");
+
+    float pullStr = mgr.centerPullStrength * 100.0f;
+    ImGui::Text("Pull Strength");
+    if (ImGui::SliderFloat("##PullStr", &pullStr, 0.0f, 100.0f, "%.0f%%", ImGuiSliderFlags_None)) {
+        mgr.centerPullStrength = pullStr / 100.0f;
+        [mgr saveSettings];
+    }
+    ImGui::Spacing();
+
+    // ── 5. 状态信息 ──
+    ImGui::Separator();
+    ImGui::Spacing();
+    const char *statusText = mgr.enabled ? "ACTIVE" : "INACTIVE";
     ImVec4 statusColor = mgr.enabled
-        ? ImVec4(0.2f, 0.9f, 0.2f, 1.0f)
+        ? ImVec4(0.0f, 0.9f, 0.4f, 1.0f)
         : ImVec4(0.9f, 0.2f, 0.2f, 1.0f);
     ImGui::TextColored(statusColor, "Status: %s", statusText);
 
-    ImGui::Text("Smoothing: %.1f%%", mgr.smoothingFactor * 100.0f);
+    ImGui::Text("Smoothing:  %.1f%%", mgr.smoothingFactor * 100.0f);
+    ImGui::Text("FOV:        %.0f px", _fovRadius);
+    if (mgr.snapToCenter) {
+        ImGui::Text("Snap Pull:  %.0f%%", mgr.centerPullStrength * 100.0f);
+    } else {
+        ImGui::TextDisabled("Snap Pull:  OFF");
+    }
 
+    // ── 触摸热区提示 ──
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
-
-    ImGui::TextDisabled("v1.0.0 | iGameGod");
+    ImGui::TextDisabled("Touch outside panel = passes through to game");
+    ImGui::TextDisabled("Drag panel title to reposition");
 
     ImGui::End();
 }
+
+#pragma mark - Public
 
 - (void)show {
     dispatch_async(dispatch_get_main_queue(), ^{
