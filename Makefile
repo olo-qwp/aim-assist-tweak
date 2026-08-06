@@ -9,7 +9,8 @@ TWEAK_NAME = AimAssist
 
 AimAssist_FILES = Tweak.xm \
     AimAssistManager.mm \
-    NativeOverlay.mm
+    NativeOverlay.mm \
+    ESPManager.mm
 
 AimAssist_FRAMEWORKS = UIKit CoreGraphics QuartzCore
 AimAssist_CFLAGS   = -fobjc-arc -Wno-deprecated-declarations

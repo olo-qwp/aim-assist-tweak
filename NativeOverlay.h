@@ -1,4 +1,7 @@
 #import <UIKit/UIKit.h>
+#import <QuartzCore/QuartzCore.h>
+
+@class ESPManager;
 
 @interface NativeOverlay : NSObject
 
@@ -6,8 +9,9 @@
 - (void)show;
 - (void)hide;
 - (BOOL)isVisible;
+- (void)setNeedsDisplay;
 
-// 返回控制面板在屏幕上的 frame（用于触摸穿透判断）
+// 控制面板 frame（用于触摸穿透判断）
 - (CGRect)panelFrame;
 
 @end
