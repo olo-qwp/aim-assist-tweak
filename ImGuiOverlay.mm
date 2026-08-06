@@ -18,6 +18,25 @@
 
 @synthesize imguiPanelRect = _imguiPanelRect;
 
+/// 获取当前所有 UIWindow（iOS 15+ 兼容方法）
++ (NSArray<UIWindow *> *)allWindows {
+    NSMutableArray<UIWindow *> *result = [NSMutableArray array];
+    if (@available(iOS 15.0, *)) {
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if ([scene isKindOfClass:[UIWindowScene class]]) {
+                UIWindowScene *ws = (UIWindowScene *)scene;
+                [result addObjectsFromArray:ws.windows];
+            }
+        }
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        [result addObjectsFromArray:[UIApplication sharedApplication].windows];
+#pragma clang diagnostic pop
+    }
+    return result;
+}
+
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hitView = [super hitTest:point withEvent:event];
     if (hitView == self || hitView == self.subviews.firstObject) {
@@ -31,7 +50,7 @@
             }
         }
         // ── 穿透到游戏：遍历所有窗口，找到最前面的游戏窗口 ──
-        NSArray<UIWindow *> *windows = [UIApplication sharedApplication].windows;
+        NSArray<UIWindow *> *windows = [self.class allWindows];
         for (NSInteger i = windows.count - 1; i >= 0; i--) {
             UIWindow *w = windows[i];
             if (w == self || w.hidden || !w.userInteractionEnabled) continue;
