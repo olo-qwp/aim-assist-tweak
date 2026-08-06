@@ -54,8 +54,16 @@ static ImGuiOverlay *overlay = nil;
 %ctor {
     @autoreleasepool {
         [[AimAssistManager sharedManager] loadSettings];
-        overlay = [ImGuiOverlay sharedOverlay];
-        [overlay show];
+
+        // 延迟初始化浮窗，等待应用 UI 完全就绪
+        // 避免在 %ctor 早期阶段 Metal/UIKit 未初始化导致崩溃
+        dispatch_async(dispatch_get_main_queue(), ^{
+            // 额外等待一帧，确保 UIWindow 层级已创建
+            dispatch_async(dispatch_get_main_queue(), ^{
+                overlay = [ImGuiOverlay sharedOverlay];
+                [overlay show];
+            });
+        });
     }
 }
 

@@ -1,0 +1,9 @@
+#!/bin/bash
+# AimAssist prerm - 卸载前清理
+
+# 如果存在 .eksafemode 崩溃标记，清理它
+if [ -f /var/mobile/.eksafemode ]; then
+    rm -f /var/mobile/.eksafemode
+fi
+
+exit 0

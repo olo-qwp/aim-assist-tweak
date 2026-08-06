@@ -1,9 +1,11 @@
 Package: com.aimassist.tweak
 Name: AimAssist
-Version: 1.0.0
-Architecture: iphoneos-arm
+Version: 1.1.0
+Architecture: iphoneos-arm64
 Description: Aim assist tool with adjustable smoothing strength for accessibility. Helps players who have difficulty with precise aiming by applying touch smoothing.
 Maintainer: AimAssist
 Author: AimAssist
 Section: Tweaks
-Depends: mobilesubstrate
+Depends: ellekit (>= 1.0), firmware (>= 15.0)
+Recommends: com.opa334.rootlesspatcher
+Tag: purpose=extension

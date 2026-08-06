@@ -1,0 +1,22 @@
+#!/bin/bash
+# AimAssist postinst - Dopamine rootless 兼容性补丁
+
+# 在 rootless 环境下，确保依赖已安装
+if [ -f /var/jb/.installed_dopamine ]; then
+    # 确保 ElleKit 正确加载插件
+    # 如果 .eksafemode 存在（之前的崩溃标记），删除它
+    if [ -f /var/mobile/.eksafemode ]; then
+        rm -f /var/mobile/.eksafemode
+    fi
+
+    # 设置正确的权限
+    chmod 755 /var/jb/Library/MobileSubstrate/DynamicLibraries/AimAssist.dylib 2>/dev/null || true
+    chmod 644 /var/jb/Library/MobileSubstrate/DynamicLibraries/AimAssist.plist 2>/dev/null || true
+
+    # 重启用户空间使插件生效
+    if [ -f /var/jb/usr/bin/sbreload ]; then
+        /var/jb/usr/bin/sbreload 2>/dev/null || true
+    fi
+fi
+
+exit 0

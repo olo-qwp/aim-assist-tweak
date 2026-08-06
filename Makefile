@@ -1,4 +1,6 @@
-TARGET := iphone:clang:latest:12.0
+ARCHS = arm64
+TARGET := iphone:clang:latest:15.0
+THEOS_PACKAGE_SCHEME = rootless
 INSTALL_TARGET_PROCESSES = SpringBoard
 
 include $(THEOS)/makefiles/common.mk
@@ -17,5 +19,6 @@ AimAssist_FILES = Tweak.xm \
 AimAssist_FRAMEWORKS = UIKit Metal MetalKit CoreGraphics QuartzCore
 AimAssist_CFLAGS   = -fobjc-arc -I$(THEOS_PROJECT_DIR)/ImGui
 AimAssist_CCFLAGS  = -std=c++17
+AimAssist_LDFLAGS  = -fuse-ld=lld
 
 include $(THEOS_MAKE_PATH)/tweak.mk

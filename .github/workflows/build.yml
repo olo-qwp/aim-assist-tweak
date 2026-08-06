@@ -51,3 +51,29 @@ jobs:
           name: AimAssist-DEB
           path: packages/*.deb
           retention-days: 90
+
+      - name: Create Release and Upload DEB
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "AimAssist Nightly Build"
+          tag_name: "nightly"
+          prerelease: true
+          files: packages/*.deb
+          body: |
+            ## AimAssist 自动构建
+
+            - 构建时间: ${{ github.event.head_commit.timestamp || 'now' }}
+            - 提交: ${{ github.sha }}
+            - 直接下载: 见下方 Assets
+
+            ### 安装说明
+            1. 下载 deb 文件
+            2. 使用 iGameGod 或 Filza 安装
+            3. 重启用户空间 (sbreload)
+            4. 在设置中启用目标应用
+
+            ### 兼容性
+            - Dopamine 2.5 beta 4+ (rootless)
+            - iOS 15.0+
+            - arm64 架构

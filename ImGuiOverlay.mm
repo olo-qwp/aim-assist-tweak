@@ -14,10 +14,12 @@
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hitView = [super hitTest:point withEvent:event];
     if (hitView == self || hitView == self.subviews.firstObject) {
-        if (ImGui::GetIO().WantCaptureMouse || ImGui::GetIO().WantCaptureKeyboard) {
+        // 确保 ImGui 上下文已初始化，避免空指针崩溃
+        ImGuiContext *ctx = ImGui::GetCurrentContext();
+        if (ctx && (ImGui::GetIO().WantCaptureMouse || ImGui::GetIO().WantCaptureKeyboard)) {
             return hitView;
         }
-        return nil;
+        return nil; // 穿透触摸到游戏
     }
     return hitView;
 }
@@ -39,6 +41,8 @@
 }
 
 - (void)feedImGuiTouches:(NSSet<UITouch *> *)touches {
+    ImGuiContext *ctx = ImGui::GetCurrentContext();
+    if (!ctx) return; // 上下文未初始化，不处理
     ImGuiIO &io = ImGui::GetIO();
     for (UITouch *touch in touches) {
         CGPoint loc = [touch locationInView:self];
@@ -88,55 +92,66 @@
 
 - (void)setupMetalAndImGui {
     if (_initialized) return;
-    _initialized = YES;
 
-    // ── Metal 设备 ──
-    _device       = MTLCreateSystemDefaultDevice();
-    _commandQueue = [_device newCommandQueue];
+    @try {
+        // ── Metal 设备 ──
+        _device = MTLCreateSystemDefaultDevice();
+        if (!_device) {
+            NSLog(@"[AimAssist] Metal device creation failed, aborting overlay init");
+            return;
+        }
+        _commandQueue = [_device newCommandQueue];
 
-    CGRect screenBounds = [UIScreen mainScreen].bounds;
+        CGRect screenBounds = [UIScreen mainScreen].bounds;
 
-    _mtkView = [[MTKView alloc] initWithFrame:screenBounds device:_device];
-    _mtkView.delegate     = self;
-    _mtkView.clearColor   = MTLClearColorMake(0, 0, 0, 0);
-    _mtkView.backgroundColor = [UIColor clearColor];
-    _mtkView.opaque       = NO;
-    _mtkView.userInteractionEnabled = YES;
-    _mtkView.enableSetNeedsDisplay = NO;
-    _mtkView.paused = NO;
+        _mtkView = [[MTKView alloc] initWithFrame:screenBounds device:_device];
+        _mtkView.delegate     = self;
+        _mtkView.clearColor   = MTLClearColorMake(0, 0, 0, 0);
+        _mtkView.backgroundColor = [UIColor clearColor];
+        _mtkView.opaque       = NO;
+        _mtkView.userInteractionEnabled = YES;
+        _mtkView.enableSetNeedsDisplay = NO;
+        _mtkView.paused = NO;
 
-    _window = [[ImGuiOverlayWindow alloc] initWithFrame:screenBounds];
-    _window.windowLevel       = UIWindowLevelAlert + 100;
-    _window.rootViewController = [[UIViewController alloc] init];
-    _window.rootViewController.view = _mtkView;
-    _window.backgroundColor   = [UIColor clearColor];
-    _window.opaque            = NO;
-    _window.userInteractionEnabled = YES;
-    _window.hidden            = NO;
+        _window = [[ImGuiOverlayWindow alloc] initWithFrame:screenBounds];
+        _window.windowLevel       = UIWindowLevelAlert + 100;
+        _window.rootViewController = [[UIViewController alloc] init];
+        _window.rootViewController.view = _mtkView;
+        _window.backgroundColor   = [UIColor clearColor];
+        _window.opaque            = NO;
+        _window.userInteractionEnabled = YES;
+        _window.hidden            = NO;
 
-    // ── ImGui 初始化 ──
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-    ImGuiIO &io = ImGui::GetIO();
-    io.DisplaySize = ImVec2(screenBounds.size.width, screenBounds.size.height);
-    io.IniFilename = NULL;
+        // ── ImGui 初始化 ──
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        ImGuiIO &io = ImGui::GetIO();
+        io.DisplaySize = ImVec2(screenBounds.size.width, screenBounds.size.height);
+        io.IniFilename = NULL;
 
-    ImGui::StyleColorsDark();
-    ImGuiStyle &style = ImGui::GetStyle();
-    style.ScaleAllSizes(2.0f);
-    style.WindowRounding  = 8.0f;
-    style.FrameRounding   = 4.0f;
-    style.GrabRounding    = 4.0f;
-    style.Alpha           = 0.9f;
+        ImGui::StyleColorsDark();
+        ImGuiStyle &style = ImGui::GetStyle();
+        style.ScaleAllSizes(2.0f);
+        style.WindowRounding  = 8.0f;
+        style.FrameRounding   = 4.0f;
+        style.GrabRounding    = 4.0f;
+        style.Alpha           = 0.9f;
 
-    ImGui_ImplMetal_Init(_device);
+        ImGui_ImplMetal_Init(_device);
 
-    // ── 渲染循环 ──
-    _displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(renderLoop:)];
-    [_displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+        _initialized = YES;
+
+        // ── 渲染循环 ──
+        _displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(renderLoop:)];
+        [_displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    } @catch (NSException *exception) {
+        NSLog(@"[AimAssist] Exception during setup: %@ - %@", exception.name, exception.reason);
+        _initialized = NO;
+    }
 }
 
 - (void)renderLoop:(CADisplayLink *)link {
+    if (!_initialized || !_mtkView) return;
     [_mtkView draw];
 }
 
@@ -144,7 +159,7 @@
 - (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {}
 
 - (void)drawInMTKView:(MTKView *)view {
-    if (!_showUI) return;
+    if (!_initialized || !_showUI) return;
 
     ImGuiIO &io = ImGui::GetIO();
     io.DisplaySize = ImVec2(view.bounds.size.width, view.bounds.size.height);
@@ -231,6 +246,7 @@
 - (void)show {
     dispatch_async(dispatch_get_main_queue(), ^{
         [self setupMetalAndImGui];
+        if (!_initialized) return;
         self->_window.hidden = NO;
         self->_showUI = YES;
     });
