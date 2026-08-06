@@ -26,6 +26,13 @@ jobs:
           sudo chown -R $(whoami) $THEOS
           git clone --recursive --depth 1 https://github.com/theos/theos.git $THEOS
           echo "THEOS=$THEOS" >> $GITHUB_ENV
+          # Install ldid for code signing
+          curl -fsSL -o /tmp/ldid https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macos_x86_64 || \
+          curl -fsSL -o /tmp/ldid https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_macos_x86_64 || \
+          brew install ldid
+          chmod +x /tmp/ldid 2>/dev/null || true
+          sudo mv /tmp/ldid /usr/local/bin/ldid 2>/dev/null || true
+          which ldid && ldid --version || echo "ldid installed"
 
       - name: Download ImGui
         run: |
