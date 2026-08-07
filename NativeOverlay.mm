@@ -1,141 +1,8 @@
 #import "NativeOverlay.h"
 #import "AimAssistManager.h"
 #import "ESPManager.h"
+#import "ScreenScanner.h"
 #import <QuartzCore/QuartzCore.h>
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  ESP 演示数据生成器
-//  在实际游戏内存读取代码接入前，生成演示数据供测试
-//  接入游戏数据后，将 ESPManager updatePlayers: 替换为实际数据即可
-// ═══════════════════════════════════════════════════════════════════════════
-@interface ESPDemoDataGenerator : NSObject
-@property (nonatomic, strong) NSTimer *timer;
-@property (nonatomic, assign) CGFloat angle;
-- (void)start;
-- (void)stop;
-@end
-
-@implementation ESPDemoDataGenerator
-
-- (void)start {
-    _angle = 0;
-    _timer = [NSTimer scheduledTimerWithTimeInterval:0.05
-                                              target:self
-                                            selector:@selector(generateDemoData)
-                                            userInfo:nil
-                                             repeats:YES];
-}
-
-- (void)stop {
-    [_timer invalidate];
-    _timer = nil;
-}
-
-- (void)generateDemoData {
-    CGSize screen = [UIScreen mainScreen].bounds.size;
-    CGFloat cx = screen.width * 0.5;
-    CGFloat cy = screen.height * 0.5;
-
-    _angle += 0.02;
-
-    // 生成3个演示敌人
-    NSMutableArray *players = [NSMutableArray array];
-
-    // 敌人1 - 在屏幕右侧移动（模拟敌人）
-    ESPPlayerData *p1 = [[ESPPlayerData alloc] init];
-    p1.isValid = YES;
-    p1.isEnemy = YES;
-    p1.health = 0.75;
-    p1.name = @"Enemy-1";
-    CGFloat e1x = cx + 150 * cos(_angle);
-    CGFloat e1y = cy - 100 + 80 * sin(_angle * 0.7);
-    p1.screenPos = CGPointMake(e1x, e1y);
-    p1.boxRect = CGRectMake(e1x - 20, e1y - 40, 40, 80);
-    // 骨骼数据
-    p1.hasBones = YES;
-    CGFloat headY = e1y - 40;
-    p1->bonePositions[ESPBoneHead]      = CGPointMake(e1x, headY);
-    p1->bonePositions[ESPBoneNeck]      = CGPointMake(e1x, headY + 12);
-    p1->bonePositions[ESPBoneChest]     = CGPointMake(e1x, headY + 22);
-    p1->bonePositions[ESPBonePelvis]    = CGPointMake(e1x, headY + 42);
-    p1->bonePositions[ESPBoneLUpperArm] = CGPointMake(e1x - 14, headY + 14);
-    p1->bonePositions[ESPBoneLForearm]  = CGPointMake(e1x - 18, headY + 28);
-    p1->bonePositions[ESPBoneLHand]     = CGPointMake(e1x - 16, headY + 38);
-    p1->bonePositions[ESPBoneRUpperArm] = CGPointMake(e1x + 14, headY + 14);
-    p1->bonePositions[ESPBoneRForearm]  = CGPointMake(e1x + 18, headY + 28);
-    p1->bonePositions[ESPBoneRHand]     = CGPointMake(e1x + 16, headY + 38);
-    p1->bonePositions[ESPBoneLThigh]    = CGPointMake(e1x - 8,  headY + 50);
-    p1->bonePositions[ESPBoneLShin]     = CGPointMake(e1x - 6,  headY + 70);
-    p1->bonePositions[ESPBoneLFoot]     = CGPointMake(e1x - 8,  headY + 85);
-    p1->bonePositions[ESPBoneRThigh]    = CGPointMake(e1x + 8,  headY + 50);
-    p1->bonePositions[ESPBoneRShin]     = CGPointMake(e1x + 6,  headY + 70);
-    p1->bonePositions[ESPBoneRFoot]     = CGPointMake(e1x + 8,  headY + 85);
-    [players addObject:p1];
-
-    // 敌人2 - 在屏幕左侧（自动瞄准不处理，因为是左半屏）
-    ESPPlayerData *p2 = [[ESPPlayerData alloc] init];
-    p2.isValid = YES;
-    p2.isEnemy = YES;
-    p2.health = 0.45;
-    p2.name = @"Enemy-2";
-    CGFloat e2x = 120 + 60 * sin(_angle * 0.5);
-    CGFloat e2y = cy - 50;
-    p2.screenPos = CGPointMake(e2x, e2y);
-    p2.boxRect = CGRectMake(e2x - 18, e2y - 36, 36, 72);
-    p2.hasBones = YES;
-    CGFloat h2y = e2y - 36;
-    p2->bonePositions[ESPBoneHead]      = CGPointMake(e2x, h2y);
-    p2->bonePositions[ESPBoneNeck]      = CGPointMake(e2x, h2y + 10);
-    p2->bonePositions[ESPBoneChest]     = CGPointMake(e2x, h2y + 20);
-    p2->bonePositions[ESPBonePelvis]    = CGPointMake(e2x, h2y + 38);
-    p2->bonePositions[ESPBoneLUpperArm] = CGPointMake(e2x - 12, h2y + 12);
-    p2->bonePositions[ESPBoneLForearm]  = CGPointMake(e2x - 16, h2y + 24);
-    p2->bonePositions[ESPBoneLHand]     = CGPointMake(e2x - 14, h2y + 34);
-    p2->bonePositions[ESPBoneRUpperArm] = CGPointMake(e2x + 12, h2y + 12);
-    p2->bonePositions[ESPBoneRForearm]  = CGPointMake(e2x + 16, h2y + 24);
-    p2->bonePositions[ESPBoneRHand]     = CGPointMake(e2x + 14, h2y + 34);
-    p2->bonePositions[ESPBoneLThigh]    = CGPointMake(e2x - 7,  h2y + 46);
-    p2->bonePositions[ESPBoneLShin]     = CGPointMake(e2x - 5,  h2y + 64);
-    p2->bonePositions[ESPBoneLFoot]     = CGPointMake(e2x - 7,  h2y + 78);
-    p2->bonePositions[ESPBoneRThigh]    = CGPointMake(e2x + 7,  h2y + 46);
-    p2->bonePositions[ESPBoneRShin]     = CGPointMake(e2x + 5,  h2y + 64);
-    p2->bonePositions[ESPBoneRFoot]     = CGPointMake(e2x + 7,  h2y + 78);
-    [players addObject:p2];
-
-    // 敌人3 - 在屏幕上方
-    ESPPlayerData *p3 = [[ESPPlayerData alloc] init];
-    p3.isValid = YES;
-    p3.isEnemy = NO; // 友军
-    p3.health = 0.9;
-    p3.name = @"Teammate";
-    CGFloat e3x = cx + 80 * sin(_angle * 0.3);
-    CGFloat e3y = 120 + 40 * sin(_angle * 0.5);
-    p3.screenPos = CGPointMake(e3x, e3y);
-    p3.boxRect = CGRectMake(e3x - 18, e3y - 36, 36, 72);
-    p3.hasBones = YES;
-    CGFloat h3y = e3y - 36;
-    p3->bonePositions[ESPBoneHead]      = CGPointMake(e3x, h3y);
-    p3->bonePositions[ESPBoneNeck]      = CGPointMake(e3x, h3y + 10);
-    p3->bonePositions[ESPBoneChest]     = CGPointMake(e3x, h3y + 20);
-    p3->bonePositions[ESPBonePelvis]    = CGPointMake(e3x, h3y + 38);
-    p3->bonePositions[ESPBoneLUpperArm] = CGPointMake(e3x - 12, h3y + 12);
-    p3->bonePositions[ESPBoneLForearm]  = CGPointMake(e3x - 16, h3y + 24);
-    p3->bonePositions[ESPBoneLHand]     = CGPointMake(e3x - 14, h3y + 34);
-    p3->bonePositions[ESPBoneRUpperArm] = CGPointMake(e3x + 12, h3y + 12);
-    p3->bonePositions[ESPBoneRForearm]  = CGPointMake(e3x + 16, h3y + 24);
-    p3->bonePositions[ESPBoneRHand]     = CGPointMake(e3x + 14, h3y + 34);
-    p3->bonePositions[ESPBoneLThigh]    = CGPointMake(e3x - 7,  h3y + 46);
-    p3->bonePositions[ESPBoneLShin]     = CGPointMake(e3x - 5,  h3y + 64);
-    p3->bonePositions[ESPBoneLFoot]     = CGPointMake(e3x - 7,  h3y + 78);
-    p3->bonePositions[ESPBoneRThigh]    = CGPointMake(e3x + 7,  h3y + 46);
-    p3->bonePositions[ESPBoneRShin]     = CGPointMake(e3x + 5,  h3y + 64);
-    p3->bonePositions[ESPBoneRFoot]     = CGPointMake(e3x + 7,  h3y + 78);
-    [players addObject:p3];
-
-    [[ESPManager sharedManager] updatePlayers:players];
-}
-
-@end
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  ESP 绘制视图 — 覆盖全屏，绘制骨骼/方框/准心/FOV
@@ -577,10 +444,6 @@
 
 - (void)espToggled:(UISwitch *)s {
     [ESPManager sharedManager].espEnabled = s.on;
-    if (!s.on) {
-        // 关闭ESP时也清除演示数据
-        [[ESPManager sharedManager] updatePlayers:@[]];
-    }
 }
 
 - (void)boneToggled:(UISwitch *)s {
@@ -626,7 +489,6 @@
     OverlayWindow *_overlayWindow;  // 控制面板窗口
     ControlPanel *_panelView;       // 控制面板
     ESPDrawView *_espView;         // ESP 绘制视图（添加到游戏主窗口）
-    ESPDemoDataGenerator *_demoGen; // 演示数据生成器
 }
 
 + (instancetype)sharedOverlay {
@@ -641,7 +503,6 @@
 - (instancetype)init {
     self = [super init];
     if (self) {
-        _demoGen = [[ESPDemoDataGenerator alloc] init];
         [self setupESPView];
         [self setupPanelWindow];
         [self setupPanel];
@@ -656,7 +517,6 @@
         _espView = [[ESPDrawView alloc] initWithFrame:keyWindow.bounds];
         _espView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         [keyWindow addSubview:_espView];
-        [_demoGen start];
     }
 }
 
@@ -742,14 +602,15 @@
     }
     UIWindow *kw = [self findKeyWindow];
     if (kw) _espView.frame = kw.bounds;
-    if (!_demoGen.timer) [_demoGen start];
+    // 启动屏幕扫描器（基于计算机视觉检测真实敌人）
+    [[ScreenScanner sharedScanner] startScanning];
 }
 
 - (void)hide {
     _overlayWindow.hidden = YES;
     [_espView removeFromSuperview];
     _espView = nil;
-    [_demoGen stop];
+    [[ScreenScanner sharedScanner] stopScanning];
 }
 
 - (BOOL)isVisible {

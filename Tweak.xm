@@ -3,6 +3,7 @@
 #import "AimAssistManager.h"
 #import "NativeOverlay.h"
 #import "ESPManager.h"
+#import "ScreenScanner.h"
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Ivar 修改架构 — v3.0 (ESP驱动自瞄)
@@ -138,9 +139,11 @@ static void aa_findTouchIvars() {
     @autoreleasepool {
         [AimAssistManager sharedManager];
         [ESPManager sharedManager];
+        [ScreenScanner sharedScanner];
     }
 }
 
 %dtor {
     [[NativeOverlay sharedOverlay] hide];
+    [[ScreenScanner sharedScanner] stopScanning];
 }
