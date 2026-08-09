@@ -493,11 +493,11 @@
             // 头部精化：框顶 1/6 区域有肤色 → 用肤色质心当真实头部（自瞄更准）
             CGFloat headY = screenY - boxH * 0.4f;
             if (headSkinRatio > 0.015f) {
-                long skinSumX = 0, skinSumY = 0; int skinN = 0;
+                long skinSumY = 0; int skinN = 0;
                 for (size_t hy = minY; hy < minY + headH; hy++) {
                     for (size_t hx = minX; hx <= maxX; hx++) {
                         if (detectMap[hy * width + hx] == 3) {
-                            skinSumX += hx; skinSumY += hy; skinN++;
+                            skinSumY += hy; skinN++;
                         }
                     }
                 }
