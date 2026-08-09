@@ -16,6 +16,7 @@ AimAssist_FILES = Tweak.xm \
 AimAssist_FRAMEWORKS = UIKit CoreGraphics QuartzCore CoreImage CoreVideo ImageIO
 AimAssist_CFLAGS   = -fobjc-arc -Wno-deprecated-declarations
 AimAssist_CCFLAGS  = -std=c++17
-AimAssist_LDFLAGS  = -lobjc
+# 强制 MSInitialize 进导出表（dyld3 的 dlsym 只看 export trie，不看 symtab）
+AimAssist_LDFLAGS  = -lobjc -Wl,-exported_symbol,_MSInitialize
 
 include $(THEOS_MAKE_PATH)/tweak.mk
