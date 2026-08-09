@@ -203,7 +203,8 @@ static size_t cocosVectorSize(void *v) {
     __block BOOL found = NO;
     __block int budget = 400;
 
-    void (^walk)(void *) = ^(void *node) {
+    __block void (^walk)(void *);
+    walk = ^(void *node) {
         if (budget <= 0) return;
         budget--;
         if (!node) return;
