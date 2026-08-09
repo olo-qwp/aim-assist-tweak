@@ -1,4 +1,5 @@
 #import "ScreenScanner.h"
+#import "EnemyMemoryReader.h"
 #import <CoreImage/CoreImage.h>
 #import <CoreVideo/CoreVideo.h>
 #import <ImageIO/ImageIO.h>
@@ -46,6 +47,7 @@
     float _selConf;           // 置信度 0~1
     int _selMiss;             // 连续丢失帧数
     int _selStable;           // 连续稳定帧数（≥2 才输出锁定，防单帧误锁）
+    BOOL _cocosMode;          // 选中模型由 Cocos2d-x 内存树跟踪（无偏移内存路径）
 }
 @end
 
@@ -298,7 +300,20 @@
     _selConf = 1.0f;
     _selMiss = 0;
     _selStable = 0;
+    _cocosMode = NO;
     _hasSelected = YES;
+
+    // 若 Cocos2d-x 内存路径可用 → 用场景树锚点匹配接管跟踪（完全内存、无偏移）
+    EnemyMemoryReader *mem = [EnemyMemoryReader sharedReader];
+    if (mem.cocosAvailable) {
+        CGPoint memPos; float memSz = 0;
+        if ([mem trackCocosModelNear:center outPos:&memPos outSize:&memSz]) {
+            _selPos = memPos;
+            _selSize = memSz;
+            _cocosMode = YES;
+            fprintf(stderr, "[AimAssist] model locked via Cocos memory tree\n");
+        }
+    }
     fprintf(stderr, "[AimAssist] model selected: region=%d size=%.0fx%.0f\n",
             count, boxW, boxH);
 }
@@ -307,6 +322,7 @@
     _hasSelected = NO;
     _selConf = 0.0f;
     _selMiss = 0;
+    _cocosMode = NO;
     fprintf(stderr, "[AimAssist] model lock cleared\n");
 }
 
@@ -534,17 +550,44 @@
                 // 有选中模型 → 优先跟踪锁定目标
                 NSArray<ESPPlayerData *> *entities;
                 if (_hasSelected) {
-                    [self trackSelectedModelInImage:screenshot originalSize:origSize];
-                    if (_hasSelected && _selMiss == 0 && _selStable >= 2) {
-                        ESPPlayerData *locked = [self makeLockedPlayer];
-                        entities = locked ? @[locked] : @[];
+                    if (_cocosMode) {
+                        // Cocos 内存树跟踪（无偏移、精确）：锚点=上一帧位置
+                        CGPoint memPos; float memSz = 0;
+                        if ([[EnemyMemoryReader sharedReader] trackCocosModelNear:_selPos
+                                                                          outPos:&memPos
+                                                                         outSize:&memSz]) {
+                            _selPos = memPos;
+                            _selSize = memSz;
+                            _selConf = 0.9f;
+                            _selMiss = 0;
+                            _selStable++;
+                        } else {
+                            _selMiss++;
+                            _selStable = 0;
+                            if (_selMiss >= 12) { // 1.2s 无内存节点 → 回退屏幕跟踪
+                                _cocosMode = NO;
+                                fprintf(stderr, "[AimAssist] cocos lock lost -> screen tracking\n");
+                            }
+                        }
+                        if (_cocosMode && _selMiss == 0 && _selStable >= 2) {
+                            ESPPlayerData *locked = [self makeLockedPlayer];
+                            entities = locked ? @[locked] : @[];
+                        } else {
+                            entities = @[];
+                        }
                     } else {
-                        entities = @[]; // 跟踪中/未稳定（<2帧）/丢失中，暂不输出
-                    }
-                    if (!_hasSelected) {
-                        // 放弃锁定 → 回退常规检测
-                        NSArray *cands = [self detectEnemiesInImage:screenshot originalSize:origSize];
-                        entities = [self stabilize:cands];
+                        [self trackSelectedModelInImage:screenshot originalSize:origSize];
+                        if (_hasSelected && _selMiss == 0 && _selStable >= 2) {
+                            ESPPlayerData *locked = [self makeLockedPlayer];
+                            entities = locked ? @[locked] : @[];
+                        } else {
+                            entities = @[]; // 跟踪中/未稳定（<2帧）/丢失中，暂不输出
+                        }
+                        if (!_hasSelected) {
+                            // 放弃锁定 → 回退常规检测
+                            NSArray *cands = [self detectEnemiesInImage:screenshot originalSize:origSize];
+                            entities = [self stabilize:cands];
+                        }
                     }
                 } else {
                     NSArray *cands = [self detectEnemiesInImage:screenshot originalSize:origSize];
@@ -559,8 +602,9 @@
                     // 更新 ESP 数据
                     if (entities.count > 0) {
                         [[ESPManager sharedManager] updatePlayers:entities];
-                        NSString *ds = _hasSelected ? @"模型锁定" :
-                            (_calibColors.count > 0 ? @"屏幕识别(校准)" : @"屏幕识别");
+                        NSString *ds;
+                        if (_hasSelected) ds = _cocosMode ? @"模型锁定(Cocos内存)" : @"模型锁定";
+                        else ds = (_calibColors.count > 0 ? @"屏幕识别(校准)" : @"屏幕识别");
                         [[ESPManager sharedManager] setDataSource:ds];
                         _emptyFrames = 0;
                     } else {

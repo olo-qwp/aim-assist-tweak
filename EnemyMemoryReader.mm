@@ -73,6 +73,20 @@ static BOOL g_badComponent[kComponentTypeCount];
 static BOOL g_badScript[kEnemyScriptTypeCount];
 static BOOL g_badScenePath;   // 场景遍历路径整体失败（无 SceneManager API 等）
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  Cocos2d-x 内存路径（无偏移）—— dlsym 引擎导出符号 + 场景树遍历
+//  覆盖非 Unity 手游（cocos2d-x 3.x 导出符号稳定）
+//  mangled 符号：cocos2d::Director::getInstance / getRunningScene /
+//  Node::getWorldPosition / getContentSize / getChildren / Director::getWinSize
+// ═══════════════════════════════════════════════════════════════════════════
+static void *(*cocos_Director_getInstance)(void);
+static void *(*cocos_Director_getRunningScene)(void *);
+static uint64_t (*cocos_Node_getWorldPosition)(void *);   // Vec2 挤在低 64 位
+static uint64_t (*cocos_Node_getContentSize)(void *);     // Size 同
+static void *(*cocos_Node_getChildren)(void *);           // const Vector<Node*>&
+static uint64_t (*cocos_Director_getWinSize)(void *);
+static BOOL g_cocos = NO;
+
 // ── arm64: Il2CppObject 头 16 字节(klass+monitor)，boxed struct 数据从 16 开始 ──
 static float *AA_boxedFloats(void *boxed) { return (float *)((char *)boxed + 16); }
 
@@ -130,6 +144,110 @@ typedef struct { float x, y, z; } AA_WPos;
 }
 
 - (BOOL)isUnityAvailable { return _unity; }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Cocos2d-x 探测 — dlsym 引擎导出符号（无偏移）
+// ═══════════════════════════════════════════════════════════════════════════
+- (BOOL)probeCocos {
+#define COCOS_SYM(var, mangled) \
+    var = (__typeof__(var))dlsym(RTLD_DEFAULT, mangled); \
+    if (!var) return NO;
+
+    COCOS_SYM(cocos_Director_getInstance, "_ZN7cocos2d8Director11getInstanceEv");
+    COCOS_SYM(cocos_Director_getRunningScene, "_ZN7cocos2d8Director16getRunningSceneEv");
+    COCOS_SYM(cocos_Node_getWorldPosition, "_ZNK7cocos2d4Node16getWorldPositionEv");
+    COCOS_SYM(cocos_Node_getContentSize, "_ZNK7cocos2d4Node14getContentSizeEv");
+    COCOS_SYM(cocos_Node_getChildren, "_ZNK7cocos2d4Node11getChildrenEv");
+    COCOS_SYM(cocos_Director_getWinSize, "_ZNK7cocos2d8Director10getWinSizeEv");
+#undef COCOS_SYM
+    return YES;
+}
+
+- (BOOL)cocosAvailable { return g_cocos; }
+
+// Cocos Vector<Node*> 内存布局（libc++ std::vector 包装）：
+//   [0]=begin指针 [8]=end [16]=end_of_storage；size=(end-begin)/8
+static void *cocosVectorData(void *v) { return *(void **)v; }
+static size_t cocosVectorSize(void *v) {
+    return (((size_t *)v)[1] - ((size_t *)v)[0]) >> 3;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Cocos 树遍历 + 锚点匹配：
+//  在运行场景的节点树中找离锚点（选中模型屏幕位置）最近的合理尺寸节点，
+//  用其世界坐标驱动自瞄——完全内存、无偏移、稳定。
+//  (ponytail: 每帧全树遍历（预算 400 节点），不持有节点指针跨帧，
+//   节点销毁自动落到次近节点，无野指针风险)
+// ═══════════════════════════════════════════════════════════════════════════
+- (BOOL)trackCocosModelNear:(CGPoint)anchor outPos:(CGPoint *)outPos outSize:(float *)outSize {
+    if (!g_cocos || !cocos_Director_getRunningScene || !cocos_Node_getChildren ||
+        !cocos_Node_getWorldPosition || !cocos_Node_getContentSize || !cocos_Director_getWinSize)
+        return NO;
+
+    void *dir = cocos_Director_getInstance();
+    if (!dir) return NO;
+    void *scene = cocos_Director_getRunningScene(dir);
+    if (!scene) return NO;
+    uint64_t ws = cocos_Director_getWinSize(dir);
+    float designW = (float)(ws & 0xffffffffu);
+    float designH = (float)(ws >> 32);
+    if (designW < 1 || designH < 1) return NO;
+
+    CGSize ss = [UIScreen mainScreen].bounds.size;
+    float scale = MIN(ss.width / designW, ss.height / designH);
+    if (scale <= 0) return NO;
+
+    // 递归遍历，收集最近节点
+    __block float bestD = 1e18f;
+    __block float bestX = 0, bestY = 0, bestSz = 0;
+    __block BOOL found = NO;
+    __block int budget = 400;
+
+    void (^walk)(void *) = ^(void *node) {
+        if (budget <= 0) return;
+        budget--;
+        if (!node) return;
+
+        uint64_t wv = cocos_Node_getWorldPosition(node);
+        float wx = (float)(wv & 0xffffffffu);
+        float wy = (float)(wv >> 32);
+        uint64_t cs = cocos_Node_getContentSize(node);
+        float cw = (float)(cs & 0xffffffffu);
+        float ch = (float)(cs >> 32);
+
+        // 尺寸过滤：节点要有合理大小（设计单位），排除零尺寸空节点/巨大背景
+        if (cw >= 10.0f && ch >= 10.0f && cw < designW * 0.5f && ch < designH * 0.5f) {
+            // 世界坐标（原点左下）→ 屏幕坐标
+            float sx = (wx - designW * 0.5f) * scale + ss.width * 0.5f;
+            float sy = (wy - designH * 0.5f) * scale + ss.height * 0.5f;
+            if (sx > -50 && sx < ss.width + 50 && sy > -50 && sy < ss.height + 50) {
+                float d = (sx - anchor.x) * (sx - anchor.x) + (sy - anchor.y) * (sy - anchor.y);
+                if (d < bestD) {
+                    bestD = d;
+                    bestX = sx; bestY = sy;
+                    bestSz = (cw + ch) * 0.5f * scale;
+                    found = YES;
+                }
+            }
+        }
+
+        void *children = cocos_Node_getChildren(node);
+        if (children) {
+            void **items = cocosVectorData(children);
+            size_t n = cocosVectorSize(children);
+            for (size_t i = 0; i < n && budget > 0; i++) {
+                if (items[i]) walk(items[i]);
+            }
+        }
+    };
+
+    walk(scene);
+
+    if (!found) return NO;
+    if (outPos) *outPos = CGPointMake(bestX, bestY);
+    if (outSize) *outSize = bestSz;
+    return YES;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  探测 il2cpp + 缓存 Unity 类/方法（纯元数据查询，无托管调用）
@@ -525,9 +643,13 @@ typedef struct { float x, y, z; } AA_WPos;
 - (void)start {
     if (_timer) return;
     _unity = [self probeUnity];
-    fprintf(stderr, "[AimAssist] memory enemy reader: %s\n",
-            _unity ? "Unity IL2CPP available" : "unavailable -> screen scan fallback");
-    if (!_unity) return;
+    g_cocos = [self probeCocos];
+    fprintf(stderr, "[AimAssist] memory reader: unity=%s cocos=%s\n",
+            _unity ? "yes" : "no", g_cocos ? "yes" : "no");
+    if (!_unity && !g_cocos) {
+        fprintf(stderr, "[AimAssist] no engine memory path -> screen scan fallback\n");
+        return;
+    }
     memset(g_badTag, 0, sizeof(g_badTag));
     memset(g_badComponent, 0, sizeof(g_badComponent));
     memset(g_badScript, 0, sizeof(g_badScript));

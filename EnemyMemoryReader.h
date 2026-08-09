@@ -23,6 +23,12 @@
 /// 是否成功探测到 Unity IL2CPP
 - (BOOL)isUnityAvailable;
 
+/// 是否成功探测到 Cocos2d-x（无偏移内存路径）
+- (BOOL)cocosAvailable;
+
+/// Cocos 内存跟踪：在场景树中找离锚点最近的合理节点 → 屏幕坐标
+- (BOOL)trackCocosModelNear:(CGPoint)anchor outPos:(CGPoint *)outPos outSize:(float *)outSize;
+
 /// 后台队列 10Hz 轮询内存敌人数据（探测失败时自动静默）
 - (void)start;
 
