@@ -1,5 +1,6 @@
 #import "AimAssistManager.h"
 #import "ESPManager.h"
+#import "ScreenScanner.h"
 
 static NSString *const kEnabledKey    = @"AimAssist_Enabled";
 static NSString *const kStrengthKey   = @"AimAssist_Strength";
@@ -58,6 +59,18 @@ static NSString *const kFovRadiusKey  = @"AimAssist_FovRadius";
                   screenSize:(CGSize)screenSize {
     if (!_enabled || _strength <= 0.0f) return CGPointZero;
 
+    // ── 优先：用户选中的模型（准心锁定目标，最高优先级） ──
+    ScreenScanner *sc = [ScreenScanner sharedScanner];
+    if (sc.hasSelectedModel && sc.selectedConfidence > 0.5f) {
+        CGPoint head = sc.selectedModelPos;
+        CGFloat hdx = head.x - screenSize.width * 0.5f;
+        CGFloat hdy = head.y - screenSize.height * 0.5f;
+        CGFloat hdist = sqrtf(hdx * hdx + hdy * hdy);
+        if (hdist < _fovRadius) {
+            return [self pullFromTouch:touch toHead:head];
+        }
+    }
+
     ESPManager *esp = [ESPManager sharedManager];
     if (!esp.espEnabled) return CGPointZero;
 
@@ -91,11 +104,13 @@ static NSString *const kFovRadiusKey  = @"AimAssist_FovRadius";
     if (!target) return CGPointZero;
 
     CGPoint head = target->bonePositions[ESPBoneHead];
+    return [self pullFromTouch:touch toHead:head];
+}
 
-    // ── 计算拉力 ──
+// 拉力计算（供选中模型与自动检测共用）
+- (CGPoint)pullFromTouch:(CGPoint)touch toHead:(CGPoint)head {
     // 将触摸坐标向敌人头部拉动
     // strength=1.0 时，每帧拉 40% 的距离
-    // strength=0.5 时，每帧拉 20% 的距离
     CGFloat pullRatio = _strength * 0.4f;
 
     // 限制最大拉力，防止瞬移

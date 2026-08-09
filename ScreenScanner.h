@@ -48,4 +48,33 @@
 /// 清除校准色
 - (void)clearCalibration;
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  模型选择 — 用准心瞄准游戏内模型并锁定跟踪（CAMSHIFT 风格）
+//
+//  原理：
+//  1. selectModelWithScreen：截取准心周围区域 → 构建目标颜色直方图模型
+//  2. 每帧直方图反投影（每像素查表得到"属于目标"的概率）+ MeanShift
+//     迭代收敛到质心 → 跟踪目标在屏幕上的位置
+//  3. 对目标缩放/旋转鲁棒（颜色分布不变），3D 游戏走近走远都能跟
+//  4. 置信度过低/连续丢失 → 自动放弃锁定，回退常规检测
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 是否已选中模型
+@property (nonatomic, readonly) BOOL hasSelectedModel;
+
+/// 选中模型当前屏幕位置（跟踪成功时为有效值）
+@property (nonatomic, readonly) CGPoint selectedModelPos;
+
+/// 选中模型框尺寸（用于 ESP 绘制）
+@property (nonatomic, readonly) CGSize selectedModelSize;
+
+/// 选中模型置信度（0~1，>0.5 视为可靠）
+@property (nonatomic, readonly) float selectedConfidence;
+
+/// 用准心对准模型后调用：截取屏幕中心区域建模
+- (void)selectModelWithScreen;
+
+/// 取消选中模型
+- (void)clearSelectedModel;
+
 @end

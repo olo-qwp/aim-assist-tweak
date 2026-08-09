@@ -74,8 +74,23 @@
 
             // 方框
             if (esp.showBox && !CGRectIsEmpty(p.boxRect)) {
-                UIColor *color = p.isEnemy ? [UIColor redColor] : [UIColor greenColor];
+                UIColor *color = [p.name hasPrefix:@"★"] ?
+                    [UIColor colorWithRed:1.0 green:0.85 blue:0.1 alpha:1.0] :  // 锁定目标=金黄
+                    (p.isEnemy ? [UIColor redColor] : [UIColor greenColor]);
                 [self drawBox:p.boxRect color:color context:ctx];
+                if ([p.name hasPrefix:@"★"]) { // 锁定目标加粗框 + LOCK 标签
+                    CGContextSetStrokeColorWithColor(ctx, color.CGColor);
+                    CGContextSetLineWidth(ctx, 4.0);
+                    CGContextStrokeRect(ctx, CGRectInset(p.boxRect, -3, -3));
+                    NSDictionary *attrs = @{
+                        NSFontAttributeName: [UIFont boldSystemFontOfSize:13],
+                        NSForegroundColorAttributeName: [UIColor colorWithRed:1.0 green:0.85 blue:0.1 alpha:1.0]
+                    };
+                    NSString *lockTxt = [NSString stringWithFormat:@"LOCK %.0f%%",
+                                         [ScreenScanner sharedScanner].selectedConfidence * 100.0f];
+                    [lockTxt drawAtPoint:CGPointMake(p.boxRect.origin.x,
+                                                     p.boxRect.origin.y - 18) withAttributes:attrs];
+                }
             }
 
             // 血条
@@ -392,6 +407,28 @@
     [_fullView addSubview:clearCalBtn];
     cy += 30;
 
+    // ── 模型选择按钮行（准心对准游戏内模型后点"选模"锁定跟踪，通用方案） ──
+    UIButton *selBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    selBtn.frame = CGRectMake(14, cy, 62, 24);
+    selBtn.backgroundColor = [UIColor colorWithRed:0.85 green:0.6 blue:0.1 alpha:0.9];
+    selBtn.layer.cornerRadius = 6;
+    selBtn.titleLabel.font = [UIFont systemFontOfSize:12];
+    [selBtn setTitle:@"🎯选模" forState:UIControlStateNormal];
+    [selBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [selBtn addTarget:self action:@selector(selectModelTapped) forControlEvents:UIControlEventTouchUpInside];
+    [_fullView addSubview:selBtn];
+
+    UIButton *clearSelBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    clearSelBtn.frame = CGRectMake(86, cy, 62, 24);
+    clearSelBtn.backgroundColor = [UIColor colorWithWhite:0.25 alpha:0.8];
+    clearSelBtn.layer.cornerRadius = 6;
+    clearSelBtn.titleLabel.font = [UIFont systemFontOfSize:12];
+    [clearSelBtn setTitle:@"取消" forState:UIControlStateNormal];
+    [clearSelBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [clearSelBtn addTarget:self action:@selector(clearSelectTapped) forControlEvents:UIControlEventTouchUpInside];
+    [_fullView addSubview:clearSelBtn];
+    cy += 30;
+
     // 状态标签
     _aimStatusLabel = [[UILabel alloc] initWithFrame:CGRectMake(14, cy, w - 20, 18)];
     _aimStatusLabel.textColor = [UIColor colorWithWhite:0.7 alpha:1.0];
@@ -416,12 +453,37 @@
 }
 
 - (void)refreshStatus {
-    NSArray *cal = [ScreenScanner sharedScanner].calibColors;
+    ScreenScanner *sc = [ScreenScanner sharedScanner];
+    if (sc.hasSelectedModel) {
+        _statusLabel.text = [NSString stringWithFormat:@"🎯锁定中(%.0f%%) | 右半屏瞄准",
+                             sc.selectedConfidence * 100.0f];
+        return;
+    }
+    NSArray *cal = sc.calibColors;
     NSString *ds = [ESPManager sharedManager].dataSource ?: @"屏幕识别";
     if (cal.count > 0 && ![ds containsString:@"校准"]) {
         ds = [ds stringByAppendingFormat:@"(%lu色)", (unsigned long)cal.count];
     }
     _statusLabel.text = [NSString stringWithFormat:@"数据源: %@ | 右半屏瞄准", ds];
+}
+
+// ── 模型选择按钮 ──
+- (void)selectModelTapped {
+    _aimStatusLabel.text = @"选模中… 准心对准模型";
+    [[ScreenScanner sharedScanner] selectModelWithScreen];
+    [self refreshStatus];
+    _aimStatusLabel.text = [[ScreenScanner sharedScanner] hasSelectedModel] ?
+        @"已锁定目标模型 | 自瞄优先锁它" : @"选模失败: 中心区域太单调";
+}
+
+- (void)clearSelectTapped {
+    [[ScreenScanner sharedScanner] clearSelectedModel];
+    [self refreshStatus];
+    _aimStatusLabel.text = @"已取消模型锁定";
+}
+
+- (void)dealloc {
+    [_statusTimer invalidate];
 }
 
 // ── 校准按钮 ──
@@ -440,10 +502,6 @@
     [[ScreenScanner sharedScanner] clearCalibration];
     [self refreshStatus];
     _aimStatusLabel.text = @"已清除校准色";
-}
-
-- (void)dealloc {
-    [_statusTimer invalidate];
 }
 
 // ── 最小化模式 ──
@@ -474,7 +532,7 @@
     _fullView.hidden = NO;
     _minimizedView.hidden = YES;
     CGRect f = self.frame;
-    f.size = CGSizeMake(170, 240);
+    f.size = CGSizeMake(170, 270);
     self.frame = f;
     _fullView.frame = self.bounds;
     [self layoutSubviews];
@@ -619,7 +677,7 @@
 
 // ── 创建控制面板 ──
 - (void)setupPanel {
-    CGFloat pw = 170, ph = 240;
+    CGFloat pw = 170, ph = 270;
     CGFloat px = 16, py = 100;
 
     _panelView = [[ControlPanel alloc] initWithFrame:CGRectMake(px, py, pw, ph)];

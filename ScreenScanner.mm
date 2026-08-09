@@ -36,6 +36,15 @@
     int _emptyFrames;            // 连续无检测帧计数
 
     NSMutableArray<NSDictionary *> *_calibColors; // 校准色（用户自定义敌人色）
+
+    // ── 选中模型跟踪状态（仅后台队列访问） ──
+    BOOL _hasSelected;        // 是否已选中模型
+    int _selHist[512];        // 目标颜色直方图（4×4×4 = 64 桶 + 忽略背景）——用 512 槽避免越界
+    int _selHistSize;         // 直方图有效桶数
+    CGPoint _selPos;          // 选中模型当前屏幕位置（原始分辨率）
+    float _selSize;           // 选中模型框尺寸（原始分辨率 pt）
+    float _selConf;           // 置信度 0~1
+    int _selMiss;             // 连续丢失帧数
 }
 @end
 
@@ -72,6 +81,11 @@
 }
 
 - (NSArray<NSDictionary *> *)calibColors { return _calibColors; }
+
+- (BOOL)hasSelectedModel      { return _hasSelected; }
+- (CGPoint)selectedModelPos   { return _selPos; }
+- (CGSize)selectedModelSize   { return CGSizeMake(_selSize, _selSize); }
+- (float)selectedConfidence   { return _selConf; }
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  校准：截取屏幕中心区域（准心对准敌人时按下），颜色直方图提取 top 主色。
@@ -156,6 +170,199 @@
     fprintf(stderr, "[AimAssist] calibration cleared\n");
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  模型选择（CAMSHIFT 风格）：准心对准模型 → 建颜色直方图模型
+//  → 每帧直方图反投影 + MeanShift 质心迭代跟踪
+//  (ponytail: 4×4×4=64 桶直方图对缩放/旋转鲁棒；3D 目标走近走远、
+//   转身都能跟。天花板：与目标同色的其他物体/背景可能干扰，
+//   靠置信度阈值 + 丢失放弃兜底)
+// ═══════════════════════════════════════════════════════════════════════════
+- (void)selectModelWithScreen {
+    UIImage *img = [self captureScreen];
+    if (!img) return;
+    CGImageRef cg = img.CGImage;
+    if (!cg) return;
+    size_t w = CGImageGetWidth(cg), h = CGImageGetHeight(cg);
+    size_t bpr = w * 4;
+    NSMutableData *data = [NSMutableData dataWithLength:bpr * h];
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(data.mutableBytes, w, h, 8, bpr, cs,
+                                             kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(cs);
+    if (!ctx) return;
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
+    CGContextRelease(ctx);
+    UInt8 *px = (UInt8 *)data.mutableBytes;
+
+    // 中心区域（屏宽 12%，≈45-50pt）：准心对准模型时模型占中心
+    int win = (int)(w * 0.12f);
+    if (win < 12) win = 12;
+    if (win > 60) win = 60;
+    int cx0 = (int)w / 2 - win / 2, cy0 = (int)h / 2 - win / 2;
+    int total = 0;
+    memset(_selHist, 0, sizeof(_selHist));
+    for (int y = cy0; y < cy0 + win && y < (int)h; y++) {
+        for (int x = cx0; x < cx0 + win && x < (int)w; x++) {
+            size_t idx = ((size_t)y * w + x) * 4;
+            UInt8 r = px[idx], g = px[idx + 1], b = px[idx + 2];
+            int lum = (r + g + b) / 3;
+            if (lum < 40 || lum > 225) continue; // 背景/高光
+            int key = ((r >> 6) << 4) | ((g >> 6) << 2) | (b >> 6); // 0..63
+            _selHist[key]++;
+            total++;
+        }
+    }
+    if (total < 40) {
+        fprintf(stderr, "[AimAssist] select model: center too plain\n");
+        return;
+    }
+    _selHistSize = total;
+    float scale = [UIScreen mainScreen].bounds.size.width / (float)w;
+    _selPos = CGPointMake(w * 0.5f * scale, h * 0.5f * scale); // 初始=屏中心
+    _selSize = win * scale;
+    _selConf = 1.0f;
+    _selMiss = 0;
+    _hasSelected = YES;
+    fprintf(stderr, "[AimAssist] model selected: %d samples win=%d\n", total, win);
+}
+
+- (void)clearSelectedModel {
+    _hasSelected = NO;
+    _selConf = 0.0f;
+    _selMiss = 0;
+    fprintf(stderr, "[AimAssist] model lock cleared\n");
+}
+
+// 窗口命中占比（粗扫评分用）
+- (float)histScoreAt:(float)cx sy:(float)cy half:(float)half w:(size_t)w h:(size_t)h px:(UInt8 *)px {
+    int x0 = (int)(cx - half), x1 = (int)(cx + half);
+    int y0 = (int)(cy - half), y1 = (int)(cy + half);
+    if (x0 < 0) x0 = 0; if (x1 >= (int)w) x1 = (int)w - 1;
+    if (y0 < 0) y0 = 0; if (y1 >= (int)h) y1 = (int)h - 1;
+    int hit = 0, winPx = 0;
+    for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++) {
+            size_t idx = ((size_t)y * w + x) * 4;
+            int lum = (px[idx] + px[idx + 1] + px[idx + 2]) / 3;
+            if (lum < 40 || lum > 225) continue;
+            winPx++;
+            int key = ((px[idx] >> 6) << 4) | ((px[idx + 1] >> 6) << 2) | (px[idx + 2] >> 6);
+            if (_selHist[key] > 0) hit++;
+        }
+    }
+    return winPx > 0 ? (float)hit / winPx : 0.0f;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  每帧跟踪：粗扫上次位置附近找最佳起点 → MeanShift 迭代精修到质心
+//  → 置信度判定（<0.35 算丢失；连续 12 帧丢失放弃锁定）
+// ═══════════════════════════════════════════════════════════════════════════
+- (void)trackSelectedModelInImage:(UIImage *)image originalSize:(CGSize)origSize {
+    CGImageRef cg = image.CGImage;
+    if (!cg) { _selMiss++; return; }
+    size_t w = CGImageGetWidth(cg), h = CGImageGetHeight(cg);
+    size_t bpr = w * 4;
+    NSMutableData *data = [NSMutableData dataWithLength:bpr * h];
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(data.mutableBytes, w, h, 8, bpr, cs,
+                                             kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(cs);
+    if (!ctx) { _selMiss++; return; }
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
+    CGContextRelease(ctx);
+    UInt8 *px = (UInt8 *)data.mutableBytes;
+
+    float scale = origSize.width / (float)w;
+    float cx = _selPos.x / scale, cy = _selPos.y / scale;
+    float halfW = _selSize / scale * 0.5f;
+    if (halfW < 4) halfW = 4;
+    if (halfW > w * 0.5f) halfW = w * 0.5f;
+
+    // 粗扫：上次位置 ±halfW 范围（步进 halfW/2）找最高分起点
+    float bestSx = cx, bestSy = cy, bestScore = -1.0f;
+    float step = MAX(4.0f, halfW * 0.5f);
+    for (float sy = cy - halfW; sy <= cy + halfW; sy += step) {
+        for (float sx = cx - halfW; sx <= cx + halfW; sx += step) {
+            float s = [self histScoreAt:sx sy:sy half:halfW w:w h:h px:px];
+            if (s > bestScore) { bestScore = s; bestSx = sx; bestSy = sy; }
+        }
+    }
+
+    // MeanShift 迭代精修（≤10 次收敛到质心）
+    float mx = bestSx, my = bestSy;
+    for (int it = 0; it < 10; it++) {
+        double sumW = 0, sumX = 0, sumY = 0;
+        int x0 = (int)(mx - halfW), x1 = (int)(mx + halfW);
+        int y0 = (int)(my - halfW), y1 = (int)(my + halfW);
+        if (x0 < 0) x0 = 0; if (x1 >= (int)w) x1 = (int)w - 1;
+        if (y0 < 0) y0 = 0; if (y1 >= (int)h) y1 = (int)h - 1;
+        for (int y = y0; y <= y1; y++) {
+            for (int x = x0; x <= x1; x++) {
+                size_t idx = ((size_t)y * w + x) * 4;
+                int lum = (px[idx] + px[idx + 1] + px[idx + 2]) / 3;
+                if (lum < 40 || lum > 225) continue;
+                int key = ((px[idx] >> 6) << 4) | ((px[idx + 1] >> 6) << 2) | (px[idx + 2] >> 6);
+                int v = _selHist[key];
+                if (v > 0) { sumW += v; sumX += v * x; sumY += v * y; }
+            }
+        }
+        if (sumW < 1.0) break;
+        float nx = (float)(sumX / sumW), ny = (float)(sumY / sumW);
+        if (fabsf(nx - mx) < 0.5f && fabsf(ny - my) < 0.5f) { mx = nx; my = ny; break; }
+        mx = nx; my = ny;
+    }
+
+    // 置信度：最终窗口内命中像素占比
+    int x0 = (int)(mx - halfW), x1 = (int)(mx + halfW);
+    int y0 = (int)(my - halfW), y1 = (int)(my + halfW);
+    if (x0 < 0) x0 = 0; if (x1 >= (int)w) x1 = (int)w - 1;
+    if (y0 < 0) y0 = 0; if (y1 >= (int)h) y1 = (int)h - 1;
+    int hit = 0, winPx = 0;
+    for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++) {
+            size_t idx = ((size_t)y * w + x) * 4;
+            int lum = (px[idx] + px[idx + 1] + px[idx + 2]) / 3;
+            if (lum < 40 || lum > 225) continue;
+            winPx++;
+            int key = ((px[idx] >> 6) << 4) | ((px[idx + 1] >> 6) << 2) | (px[idx + 2] >> 6);
+            if (_selHist[key] > 0) hit++;
+        }
+    }
+    float conf = winPx > 0 ? (float)hit / winPx : 0.0f;
+
+    if (conf < 0.35f || hit < 8) {
+        _selMiss++;
+        if (_selMiss >= 12) { // 1.2s 未找到 → 放弃锁定，回退常规检测
+            _hasSelected = NO;
+            fprintf(stderr, "[AimAssist] model lock lost\n");
+        }
+        return;
+    }
+    _selPos = CGPointMake(mx * scale, my * scale);
+    _selConf = conf;
+    _selMiss = 0;
+}
+
+// 锁定目标的 ESPPlayerData（★ 前缀标记，绘制层高亮）
+- (ESPPlayerData *)makeLockedPlayer {
+    ESPPlayerData *p = [[ESPPlayerData alloc] init];
+    p.isValid = YES;
+    p.isEnemy = YES;
+    p.health = 1.0f;
+    p.screenPos = _selPos;
+    p.hasBones = YES;
+    p.name = @"★锁定";
+    CGFloat boxW = _selSize * 0.8f;
+    CGFloat boxH = _selSize * 1.5f;
+    p.boxRect = CGRectMake(_selPos.x - boxW * 0.5f, _selPos.y - boxH * 0.55f, boxW, boxH);
+    CGFloat topY = p.boxRect.origin.y;
+    p->bonePositions[ESPBoneHead]   = CGPointMake(_selPos.x, topY + boxH * 0.12f);
+    p->bonePositions[ESPBoneNeck]   = CGPointMake(_selPos.x, topY + boxH * 0.22f);
+    p->bonePositions[ESPBoneChest]  = CGPointMake(_selPos.x, topY + boxH * 0.35f);
+    p->bonePositions[ESPBonePelvis] = CGPointMake(_selPos.x, topY + boxH * 0.55f);
+    return p;
+}
+
 - (BOOL)isScanning { return _isScanning; }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -212,11 +419,25 @@
 
         dispatch_async(_scanQueue, ^{
             @autoreleasepool {
-                // 分析图像，检测候选敌人（颜色/运动/聚类，全在后台）
-                NSArray<ESPPlayerData *> *cands =
-                    [self detectEnemiesInImage:screenshot originalSize:origSize];
-                // 多帧确认：同一位置连续 ≥2 帧出现才算真敌人（大幅抑制误报）
-                NSArray<ESPPlayerData *> *entities = [self stabilize:cands];
+                // 有选中模型 → 优先跟踪锁定目标
+                NSArray<ESPPlayerData *> *entities;
+                if (_hasSelected) {
+                    [self trackSelectedModelInImage:screenshot originalSize:origSize];
+                    if (_hasSelected && _selMiss == 0) {
+                        ESPPlayerData *locked = [self makeLockedPlayer];
+                        entities = locked ? @[locked] : @[];
+                    } else {
+                        entities = @[]; // 跟踪丢失中（<1.2s），暂不输出
+                    }
+                    if (!_hasSelected) {
+                        // 放弃锁定 → 回退常规检测
+                        NSArray *cands = [self detectEnemiesInImage:screenshot originalSize:origSize];
+                        entities = [self stabilize:cands];
+                    }
+                } else {
+                    NSArray *cands = [self detectEnemiesInImage:screenshot originalSize:origSize];
+                    entities = [self stabilize:cands];
+                }
                 BOOL stillScanning = _isScanning;
 
                 dispatch_async(dispatch_get_main_queue(), ^{
@@ -226,8 +447,9 @@
                     // 更新 ESP 数据
                     if (entities.count > 0) {
                         [[ESPManager sharedManager] updatePlayers:entities];
-                        [[ESPManager sharedManager] setDataSource:
-                            _calibColors.count > 0 ? @"屏幕识别(校准)" : @"屏幕识别"];
+                        NSString *ds = _hasSelected ? @"模型锁定" :
+                            (_calibColors.count > 0 ? @"屏幕识别(校准)" : @"屏幕识别");
+                        [[ESPManager sharedManager] setDataSource:ds];
                         _emptyFrames = 0;
                     } else {
                         // 连续多帧无数据后清空
