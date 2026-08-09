@@ -39,4 +39,13 @@
 /// 是否启用运动检测
 @property (nonatomic, assign) BOOL motionDetectionEnabled;
 
+/// 校准敌人颜色（用户对准敌人校准后提取的主色，任何引擎通用）
+@property (nonatomic, readonly) NSArray<NSDictionary *> *calibColors;
+
+/// 校准：截取当前屏幕中心区域，提取敌人主色（准心对准敌人时按下）
+- (void)calibrateWithScreen;
+
+/// 清除校准色
+- (void)clearCalibration;
+
 @end
