@@ -9,29 +9,29 @@
 //  il2cpp 导出 API（全部 dlsym 运行时探测，零编译期依赖）
 //  Unity IL2CPP 长期稳定导出这些符号，即使游戏 strip 也会保留 il2cpp_*
 // ═══════════════════════════════════════════════════════════════════════════
-typedef void *(*aa_domain_get_t)(void);
-typedef void **(*aa_domain_get_assemblies_t)(void *, size_t *);
-typedef void *(*aa_assembly_get_image_t)(void *);
-typedef const char *(*aa_image_get_name_t)(void *);
-typedef void *(*aa_class_from_name_t)(void *, const char *, const char *);
-typedef void *(*aa_method_from_name_t)(void *, const char *, int);
-typedef void *(*aa_runtime_invoke_t)(void *, void *, void **, void **);
-typedef void *(*aa_string_new_t)(const char *);
-typedef size_t (*aa_array_length_t)(void *);
-typedef const uint16_t *(*aa_string_chars_t)(void *);
-typedef int32_t (*aa_string_length_t)(void *);
+typedef void *(*il2cpp_domain_get_t)(void);
+typedef void **(*il2cpp_domain_get_assemblies_t)(void *, size_t *);
+typedef void *(*il2cpp_assembly_get_image_t)(void *);
+typedef const char *(*il2cpp_image_get_name_t)(void *);
+typedef void *(*il2cpp_class_from_name_t)(void *, const char *, const char *);
+typedef void *(*il2cpp_class_get_method_from_name_t)(void *, const char *, int);
+typedef void *(*il2cpp_runtime_invoke_t)(void *, void *, void **, void **);
+typedef void *(*il2cpp_string_new_t)(const char *);
+typedef size_t (*il2cpp_array_length_t)(void *);
+typedef const uint16_t *(*il2cpp_string_chars_t)(void *);
+typedef int32_t (*il2cpp_string_length_t)(void *);
 
-static aa_domain_get_t             g_domain_get;
-static aa_domain_get_assemblies_t  g_domain_get_assemblies;
-static aa_assembly_get_image_t     g_assembly_get_image;
-static aa_image_get_name_t         g_image_get_name;
-static aa_class_from_name_t        g_class_from_name;
-static aa_method_from_name_t       g_method_from_name;
-static aa_runtime_invoke_t         g_runtime_invoke;
-static aa_string_new_t             g_string_new;
-static aa_array_length_t           g_array_length;
-static aa_string_chars_t           g_string_chars;
-static aa_string_length_t          g_string_length;
+static il2cpp_domain_get_t             g_domain_get;
+static il2cpp_domain_get_assemblies_t  g_domain_get_assemblies;
+static il2cpp_assembly_get_image_t     g_assembly_get_image;
+static il2cpp_image_get_name_t         g_image_get_name;
+static il2cpp_class_from_name_t        g_class_from_name;
+static il2cpp_class_get_method_from_name_t       g_method_from_name;
+static il2cpp_runtime_invoke_t         g_runtime_invoke;
+static il2cpp_string_new_t             g_string_new;
+static il2cpp_array_length_t           g_array_length;
+static il2cpp_string_chars_t           g_string_chars;
+static il2cpp_string_length_t          g_string_length;
 
 // ── 敌人 tag 列表（FPS/动作游戏通用敌人标签） ──
 static const char *kEnemyTags[] = {
