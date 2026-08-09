@@ -45,6 +45,7 @@
     float _selSize;           // 选中模型框尺寸（原始分辨率 pt）
     float _selConf;           // 置信度 0~1
     int _selMiss;             // 连续丢失帧数
+    int _selStable;           // 连续稳定帧数（≥2 才输出锁定，防单帧误锁）
 }
 @end
 
@@ -96,40 +97,21 @@
 - (void)calibrateWithScreen {
     UIImage *img = [self captureScreen];
     if (!img) return;
-    CGImageRef cgImage = img.CGImage;
-    if (!cgImage) return;
-    size_t w = CGImageGetWidth(cgImage), h = CGImageGetHeight(cgImage);
-    size_t bpr = w * 4;
-    NSMutableData *data = [NSMutableData dataWithLength:bpr * h];
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(data.mutableBytes, w, h, 8, bpr, cs,
-                                             kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
-    CGColorSpaceRelease(cs);
-    if (!ctx) return;
-    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cgImage);
-    CGContextRelease(ctx);
-    UInt8 *px = (UInt8 *)data.mutableBytes;
-
-    // 中心 50%×50% 区域（准心对准敌人时，敌人占中心）
-    size_t x0 = w / 4, x1 = w - w / 4, y0 = h / 4, y1 = h - h / 4;
-    int buckets[32768] = {0}; // 15-bit 量化桶 (r>>3)<<10 | (g>>3)<<5 | (b>>3)
-    for (size_t y = y0; y < y1; y++) {
-        for (size_t x = x0; x < x1; x++) {
-            size_t idx = (y * w + x) * 4;
-            UInt8 r = px[idx], g = px[idx + 1], b = px[idx + 2];
-            int lum = (r + g + b) / 3;
-            if (lum < 40 || lum > 225) continue;      // 近黑/近白背景
-            int sat = abs((int)r - g) + abs((int)g - b) + abs((int)r - b);
-            if (sat < 60) continue;                    // 低饱和（灰白 UI 文字）
-            int key = ((int)r >> 3) << 10 | ((int)g >> 3) << 5 | ((int)b >> 3);
-            if (key < 32768) buckets[key]++;
-        }
+    int hist[512];
+    int count = 0;
+    CGPoint center;
+    float boxW = 0, boxH = 0;
+    // 种子连通域提取：只取准心正对的目标本体，背景色不进校准
+    if (![self extractCenterRegionInImage:img hist:hist count:&count
+                                   center:&center boxW:&boxW boxH:&boxH]) {
+        fprintf(stderr, "[AimAssist] calibrate: center too plain (aim at a model)\n");
+        return;
     }
 
-    // top 3 主色
+    // 连通域内 top 3 主色
     int topKeys[3] = {-1, -1, -1}, topCnt[3] = {0, 0, 0};
-    for (int k = 0; k < 32768; k++) {
-        int c = buckets[k];
+    for (int k = 0; k < 64; k++) {
+        int c = hist[k];
         if (!c) continue;
         for (int i = 0; i < 3; i++) {
             if (c > topCnt[i]) {
@@ -139,27 +121,63 @@
             }
         }
     }
-
     NSMutableArray *colors = [NSMutableArray array];
     for (int i = 0; i < 3; i++) {
         if (topKeys[i] < 0) continue;
-        int key = topKeys[i];
-        int r = ((key >> 10) & 31) << 3;
-        int g = ((key >> 5) & 31) << 3;
-        int b = (key & 31) << 3;
-        r += 4; g += 4; b += 4; // 量化桶中心
+        int r = (((topKeys[i] >> 4) & 3) << 6) + 32;
+        int g = (((topKeys[i] >> 2) & 3) << 6) + 32;
+        int b = ((topKeys[i] & 3) << 6) + 32;
         r = MIN(255, r); g = MIN(255, g); b = MIN(255, b);
         [colors addObject:@{@"r": @(r), @"g": @(g), @"b": @(b)}];
     }
-    if (colors.count == 0) {
-        fprintf(stderr, "[AimAssist] calibrate: no dominant color in center\n");
-        return;
+    if (colors.count == 0) return;
+
+    // 验证：整帧反投影 top3 色，目标质心附近（±size）命中率 <15% →
+    // 提的是背景色 → 拒绝，防全屏误报
+    {
+        CGImageRef cg = img.CGImage;
+        size_t w = CGImageGetWidth(cg), h = CGImageGetHeight(cg);
+        size_t bpr = w * 4;
+        NSMutableData *data = [NSMutableData dataWithLength:bpr * h];
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGContextRef ctx = CGBitmapContextCreate(data.mutableBytes, w, h, 8, bpr, cs,
+                                                 kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+        CGColorSpaceRelease(cs);
+        if (ctx) {
+            CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
+            CGContextRelease(ctx);
+            UInt8 *px = (UInt8 *)data.mutableBytes;
+            float scale = [UIScreen mainScreen].bounds.size.width / (float)w;
+            int cx0 = (int)((center.x / scale) - (boxW / scale) * 0.5f);
+            int cy0 = (int)((center.y / scale) - (boxH / scale) * 0.5f);
+            int cx1 = (int)((center.x / scale) + (boxW / scale) * 0.5f);
+            int cy1 = (int)((center.y / scale) + (boxH / scale) * 0.5f);
+            if (cx0 < 0) cx0 = 0; if (cy0 < 0) cy0 = 0;
+            if (cx1 >= (int)w) cx1 = (int)w - 1; if (cy1 >= (int)h) cy1 = (int)h - 1;
+            int hit = 0, winPx = 0;
+            for (int y = cy0; y <= cy1; y++)
+                for (int x = cx0; x <= cx1; x++) {
+                    size_t idx = ((size_t)y * w + x) * 4;
+                    winPx++;
+                    int r = px[idx], g = px[idx + 1], b = px[idx + 2];
+                    for (NSDictionary *c in colors) {
+                        if (abs(r - [c[@"r"] intValue]) + abs(g - [c[@"g"] intValue]) +
+                            abs(b - [c[@"b"] intValue]) < 100) { hit++; break; }
+                    }
+                }
+            if (winPx > 0 && (float)hit / winPx < 0.15f) {
+                fprintf(stderr, "[AimAssist] calibrate: verify failed (background color?)\n");
+                return;
+            }
+        }
     }
+
     _calibColors = colors;
     NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:@"com.aimassist.settings"];
     [d setObject:colors forKey:@"AimAssist_CalibColors"];
     [d synchronize];
-    fprintf(stderr, "[AimAssist] calibrated %lu colors\n", (unsigned long)colors.count);
+    fprintf(stderr, "[AimAssist] calibrated %lu colors (region=%d)\n",
+            (unsigned long)colors.count, count);
 }
 
 - (void)clearCalibration {
@@ -171,17 +189,18 @@
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  模型选择（CAMSHIFT 风格）：准心对准模型 → 建颜色直方图模型
-//  → 每帧直方图反投影 + MeanShift 质心迭代跟踪
-//  (ponytail: 4×4×4=64 桶直方图对缩放/旋转鲁棒；3D 目标走近走远、
-//   转身都能跟。天花板：与目标同色的其他物体/背景可能干扰，
-//   靠置信度阈值 + 丢失放弃兜底)
+//  种子连通域提取 — 从准心像素扩张出"目标本体"
+//  （背景不进模型，杜绝选模窗口混入背景导致的漂移/误锁）
+//  返回 NO = 中心太单调或对准了整面背景
 // ═══════════════════════════════════════════════════════════════════════════
-- (void)selectModelWithScreen {
-    UIImage *img = [self captureScreen];
-    if (!img) return;
-    CGImageRef cg = img.CGImage;
-    if (!cg) return;
+- (BOOL)extractCenterRegionInImage:(UIImage *)image
+                              hist:(int *)outHist
+                            count:(int *)outCount
+                           center:(CGPoint *)outCenter
+                             boxW:(float *)outW
+                             boxH:(float *)outH {
+    CGImageRef cg = image.CGImage;
+    if (!cg) return NO;
     size_t w = CGImageGetWidth(cg), h = CGImageGetHeight(cg);
     size_t bpr = w * 4;
     NSMutableData *data = [NSMutableData dataWithLength:bpr * h];
@@ -189,41 +208,99 @@
     CGContextRef ctx = CGBitmapContextCreate(data.mutableBytes, w, h, 8, bpr, cs,
                                              kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
     CGColorSpaceRelease(cs);
-    if (!ctx) return;
+    if (!ctx) return NO;
     CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
     CGContextRelease(ctx);
     UInt8 *px = (UInt8 *)data.mutableBytes;
 
-    // 中心区域（屏宽 12%，≈45-50pt）：准心对准模型时模型占中心
-    int win = (int)(w * 0.12f);
-    if (win < 12) win = 12;
-    if (win > 60) win = 60;
-    int cx0 = (int)w / 2 - win / 2, cy0 = (int)h / 2 - win / 2;
-    int total = 0;
-    memset(_selHist, 0, sizeof(_selHist));
-    for (int y = cy0; y < cy0 + win && y < (int)h; y++) {
-        for (int x = cx0; x < cx0 + win && x < (int)w; x++) {
-            size_t idx = ((size_t)y * w + x) * 4;
-            UInt8 r = px[idx], g = px[idx + 1], b = px[idx + 2];
-            int lum = (r + g + b) / 3;
-            if (lum < 40 || lum > 225) continue; // 背景/高光
-            int key = ((r >> 6) << 4) | ((g >> 6) << 2) | (b >> 6); // 0..63
-            _selHist[key]++;
-            total++;
+    // 中心 3×3 均值 = 种子色（抗噪）
+    int cx = (int)w / 2, cy = (int)h / 2;
+    long sr = 0, sg = 0, sb = 0; int sn = 0;
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+            int xx = cx + dx, yy = cy + dy;
+            if (xx < 0 || xx >= (int)w || yy < 0 || yy >= (int)h) continue;
+            size_t idx = ((size_t)yy * w + xx) * 4;
+            sr += px[idx]; sg += px[idx + 1]; sb += px[idx + 2]; sn++;
+        }
+    if (sn == 0) return NO;
+    int seedR = (int)(sr / sn), seedG = (int)(sg / sn), seedB = (int)(sb / sn);
+    int lum = (seedR + seedG + seedB) / 3;
+    if (lum < 40 || lum > 225) return NO; // 中心是近黑/近白背景
+
+    // BFS 连通域（颜色距离 < 45，仅目标本体）
+    size_t cap = (size_t)w * h;
+    int *qx = (int *)malloc(cap * sizeof(int));
+    int *qy = (int *)malloc(cap * sizeof(int));
+    UInt8 *vis = (UInt8 *)calloc(cap, 1);
+    if (!qx || !qy || !vis) { free(qx); free(qy); free(vis); return NO; }
+    int head = 0, tail = 0;
+    qx[tail] = cx; qy[tail] = cy; tail++;
+    vis[(size_t)cy * w + cx] = 1;
+    int regionCount = 0;
+    long sumX = 0, sumY = 0;
+    int minX = (int)w, maxX = 0, minY = (int)h, maxY = 0;
+    memset(outHist, 0, 512 * sizeof(int));
+    while (head < tail) {
+        int x = qx[head], y = qy[head]; head++;
+        size_t idx = ((size_t)y * w + x) * 4;
+        int r = px[idx], g = px[idx + 1], b = px[idx + 2];
+        if (abs(r - seedR) + abs(g - seedG) + abs(b - seedB) > 45) continue;
+        regionCount++;
+        sumX += x; sumY += y;
+        if (x < minX) minX = x; if (x > maxX) maxX = x;
+        if (y < minY) minY = y; if (y > maxY) maxY = y;
+        int key = ((r >> 6) << 4) | ((g >> 6) << 2) | (b >> 6);
+        outHist[key]++;
+        int nb[4][2] = {{1,0},{-1,0},{0,1},{0,-1}};
+        for (int n = 0; n < 4; n++) {
+            int nx = x + nb[n][0], ny = y + nb[n][1];
+            if (nx < 0 || nx >= (int)w || ny < 0 || ny >= (int)h) continue;
+            if (vis[(size_t)ny * w + nx]) continue;
+            vis[(size_t)ny * w + nx] = 1;
+            qx[tail] = nx; qy[tail] = ny; tail++;
         }
     }
-    if (total < 40) {
-        fprintf(stderr, "[AimAssist] select model: center too plain\n");
+    free(qx); free(qy); free(vis);
+
+    if (regionCount < 30) return NO;      // 太单调（准心对准了纯色墙/天空）
+    int rw = maxX - minX + 1, rh = maxY - minY + 1;
+    if (rw > (int)w * 0.5f || rh > (int)h * 0.5f) return NO; // 太大=整面背景
+    float scale = [UIScreen mainScreen].bounds.size.width / (float)w;
+    if (outCount) *outCount = regionCount;
+    if (outCenter) *outCenter = CGPointMake((float)sumX / regionCount * scale,
+                                            (float)sumY / regionCount * scale);
+    if (outW) *outW = rw * scale;
+    if (outH) *outH = rh * scale;
+    return YES;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  模型选择（种子连通域版）：准心对准模型 → 只建目标本体直方图
+//  → 每帧直方图反投影 + MeanShift 质心迭代跟踪
+// ═══════════════════════════════════════════════════════════════════════════
+- (void)selectModelWithScreen {
+    UIImage *img = [self captureScreen];
+    if (!img) return;
+    int hist[512];
+    int count = 0;
+    CGPoint center;
+    float boxW = 0, boxH = 0;
+    if (![self extractCenterRegionInImage:img hist:hist count:&count
+                                   center:&center boxW:&boxW boxH:&boxH]) {
+        fprintf(stderr, "[AimAssist] select model: center too plain (aim at a model)\n");
         return;
     }
-    _selHistSize = total;
-    float scale = [UIScreen mainScreen].bounds.size.width / (float)w;
-    _selPos = CGPointMake(w * 0.5f * scale, h * 0.5f * scale); // 初始=屏中心
-    _selSize = win * scale;
+    memcpy(_selHist, hist, sizeof(hist));
+    _selHistSize = count;
+    _selPos = center;
+    _selSize = (boxW + boxH) * 0.5f;
     _selConf = 1.0f;
     _selMiss = 0;
+    _selStable = 0;
     _hasSelected = YES;
-    fprintf(stderr, "[AimAssist] model selected: %d samples win=%d\n", total, win);
+    fprintf(stderr, "[AimAssist] model selected: region=%d size=%.0fx%.0f\n",
+            count, boxW, boxH);
 }
 
 - (void)clearSelectedModel {
@@ -288,6 +365,18 @@
         }
     }
 
+    // 防歧义：主位置 2×halfW 环形区域扫描次优候选，
+    // 次优 > 最优×0.8 → 场景有同色干扰 → 置信度减半（宁可保守不跳锁）
+    float secondBest = 0.0f;
+    for (float sy = cy - halfW * 2.0f; sy <= cy + halfW * 2.0f; sy += step) {
+        for (float sx = cx - halfW * 2.0f; sx <= cx + halfW * 2.0f; sx += step) {
+            float ddx = sx - bestSx, ddy = sy - bestSy;
+            if (ddx * ddx + ddy * ddy < halfW * halfW) continue; // 跳过主位置附近
+            float s = [self histScoreAt:sx sy:sy half:halfW w:w h:h px:px];
+            if (s > secondBest) secondBest = s;
+        }
+    }
+
     // MeanShift 迭代精修（≤10 次收敛到质心）
     float mx = bestSx, my = bestSy;
     for (int it = 0; it < 10; it++) {
@@ -329,9 +418,11 @@
         }
     }
     float conf = winPx > 0 ? (float)hit / winPx : 0.0f;
+    if (secondBest > conf * 0.8f) conf *= 0.5f; // 同色干扰 → 歧义降置信度
 
     if (conf < 0.35f || hit < 8) {
         _selMiss++;
+        _selStable = 0;
         if (_selMiss >= 12) { // 1.2s 未找到 → 放弃锁定，回退常规检测
             _hasSelected = NO;
             fprintf(stderr, "[AimAssist] model lock lost\n");
@@ -341,6 +432,27 @@
     _selPos = CGPointMake(mx * scale, my * scale);
     _selConf = conf;
     _selMiss = 0;
+    _selStable++;
+
+    // 自适应更新：conf≥0.5 时用当前窗口像素慢更新直方图（0.15 学习率，
+    // 适应光照/视角变化防漂移；有效像素过少则不更新防背景污染）
+    if (conf >= 0.5f) {
+        int newHist[64] = {0}; int newTotal = 0;
+        for (int y = y0; y <= y1; y++) {
+            for (int x = x0; x <= x1; x++) {
+                size_t idx = ((size_t)y * w + x) * 4;
+                int lum = (px[idx] + px[idx + 1] + px[idx + 2]) / 3;
+                if (lum < 40 || lum > 225) continue;
+                int key = ((px[idx] >> 6) << 4) | ((px[idx + 1] >> 6) << 2) | (px[idx + 2] >> 6);
+                newHist[key]++; newTotal++;
+            }
+        }
+        if (newTotal > (int)((x1 - x0 + 1) * (y1 - y0 + 1)) * 0.3f) {
+            for (int k = 0; k < 64; k++) {
+                _selHist[k] = (int)(_selHist[k] * 0.85f + newHist[k] * 0.15f);
+            }
+        }
+    }
 }
 
 // 锁定目标的 ESPPlayerData（★ 前缀标记，绘制层高亮）
@@ -423,11 +535,11 @@
                 NSArray<ESPPlayerData *> *entities;
                 if (_hasSelected) {
                     [self trackSelectedModelInImage:screenshot originalSize:origSize];
-                    if (_hasSelected && _selMiss == 0) {
+                    if (_hasSelected && _selMiss == 0 && _selStable >= 2) {
                         ESPPlayerData *locked = [self makeLockedPlayer];
                         entities = locked ? @[locked] : @[];
                     } else {
-                        entities = @[]; // 跟踪丢失中（<1.2s），暂不输出
+                        entities = @[]; // 跟踪中/未稳定（<2帧）/丢失中，暂不输出
                     }
                     if (!_hasSelected) {
                         // 放弃锁定 → 回退常规检测

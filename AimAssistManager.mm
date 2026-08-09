@@ -61,8 +61,10 @@ static NSString *const kFovRadiusKey  = @"AimAssist_FovRadius";
 
     // ── 优先：用户选中的模型（准心锁定目标，最高优先级） ──
     ScreenScanner *sc = [ScreenScanner sharedScanner];
-    if (sc.hasSelectedModel && sc.selectedConfidence > 0.5f) {
+    if (sc.hasSelectedModel && sc.selectedConfidence > 0.6f) {
+        // 头部位置：锁定框顶部向下 12%（质心偏身体中心，抬到头部更准）
         CGPoint head = sc.selectedModelPos;
+        head.y -= sc.selectedModelSize.height * 0.4f;
         CGFloat hdx = head.x - screenSize.width * 0.5f;
         CGFloat hdy = head.y - screenSize.height * 0.5f;
         CGFloat hdist = sqrtf(hdx * hdx + hdy * hdy);
