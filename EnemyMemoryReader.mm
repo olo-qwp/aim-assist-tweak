@@ -167,7 +167,7 @@ typedef struct { float x, y, z; } AA_WPos;
 
 // Cocos Vector<Node*> 内存布局（libc++ std::vector 包装）：
 //   [0]=begin指针 [8]=end [16]=end_of_storage；size=(end-begin)/8
-static void *cocosVectorData(void *v) { return *(void **)v; }
+static void **cocosVectorData(void *v) { return *(void ***)v; }
 static size_t cocosVectorSize(void *v) {
     return (((size_t *)v)[1] - ((size_t *)v)[0]) >> 3;
 }
