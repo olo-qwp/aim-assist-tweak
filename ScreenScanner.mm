@@ -31,8 +31,6 @@
     UInt8 *_prevFrameData;
     size_t _prevFrameSize;
 }
-@property (nonatomic, assign) float sensitivity;
-@property (nonatomic, assign) BOOL motionDetectionEnabled;
 @end
 
 @implementation ScreenScanner
