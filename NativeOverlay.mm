@@ -370,6 +370,28 @@
     [_fullView addSubview:boxSwitch];
     cy += 28;
 
+    // ── 校准按钮行（对准敌人后点"校准"提取敌人颜色，任何引擎通用） ──
+    UIButton *calBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    calBtn.frame = CGRectMake(14, cy, 62, 24);
+    calBtn.backgroundColor = [UIColor colorWithRed:0.3 green:0.6 blue:0.3 alpha:0.9];
+    calBtn.layer.cornerRadius = 6;
+    calBtn.titleLabel.font = [UIFont systemFontOfSize:12];
+    [calBtn setTitle:@"🎯校准" forState:UIControlStateNormal];
+    [calBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [calBtn addTarget:self action:@selector(calibrateTapped) forControlEvents:UIControlEventTouchUpInside];
+    [_fullView addSubview:calBtn];
+
+    UIButton *clearCalBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    clearCalBtn.frame = CGRectMake(86, cy, 62, 24);
+    clearCalBtn.backgroundColor = [UIColor colorWithWhite:0.25 alpha:0.8];
+    clearCalBtn.layer.cornerRadius = 6;
+    clearCalBtn.titleLabel.font = [UIFont systemFontOfSize:12];
+    [clearCalBtn setTitle:@"清除" forState:UIControlStateNormal];
+    [clearCalBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [clearCalBtn addTarget:self action:@selector(clearCalibTapped) forControlEvents:UIControlEventTouchUpInside];
+    [_fullView addSubview:clearCalBtn];
+    cy += 30;
+
     // 状态标签
     _aimStatusLabel = [[UILabel alloc] initWithFrame:CGRectMake(14, cy, w - 20, 18)];
     _aimStatusLabel.textColor = [UIColor colorWithWhite:0.7 alpha:1.0];
@@ -394,8 +416,30 @@
 }
 
 - (void)refreshStatus {
-    _statusLabel.text = [NSString stringWithFormat:@"数据源: %@ | 右半屏瞄准",
-                         [ESPManager sharedManager].dataSource ?: @"屏幕识别"];
+    NSArray *cal = [ScreenScanner sharedScanner].calibColors;
+    NSString *ds = [ESPManager sharedManager].dataSource ?: @"屏幕识别";
+    if (cal.count > 0 && ![ds containsString:@"校准"]) {
+        ds = [ds stringByAppendingFormat:@"(%lu色)", (unsigned long)cal.count];
+    }
+    _statusLabel.text = [NSString stringWithFormat:@"数据源: %@ | 右半屏瞄准", ds];
+}
+
+// ── 校准按钮 ──
+- (void)calibrateTapped {
+    // 提示：先把准心对准敌人再点
+    _aimStatusLabel.text = @"校准中… 准心对准敌人";
+    [[ScreenScanner sharedScanner] calibrateWithScreen];
+    [self refreshStatus];
+    NSArray *cal = [ScreenScanner sharedScanner].calibColors;
+    _aimStatusLabel.text = cal.count > 0 ?
+        [NSString stringWithFormat:@"已校准 %lu 色 | 目标: 头部", (unsigned long)cal.count] :
+        @"校准失败: 中心无显著颜色";
+}
+
+- (void)clearCalibTapped {
+    [[ScreenScanner sharedScanner] clearCalibration];
+    [self refreshStatus];
+    _aimStatusLabel.text = @"已清除校准色";
 }
 
 - (void)dealloc {
@@ -430,7 +474,7 @@
     _fullView.hidden = NO;
     _minimizedView.hidden = YES;
     CGRect f = self.frame;
-    f.size = CGSizeMake(170, 210);
+    f.size = CGSizeMake(170, 240);
     self.frame = f;
     _fullView.frame = self.bounds;
     [self layoutSubviews];
@@ -575,7 +619,7 @@
 
 // ── 创建控制面板 ──
 - (void)setupPanel {
-    CGFloat pw = 170, ph = 210;
+    CGFloat pw = 170, ph = 240;
     CGFloat px = 16, py = 100;
 
     _panelView = [[ControlPanel alloc] initWithFrame:CGRectMake(px, py, pw, ph)];

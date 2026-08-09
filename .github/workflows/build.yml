@@ -60,7 +60,7 @@ jobs:
           cp igamegod/AimAssist.plist /tmp/igdeb/Library/MobileSubstrate/DynamicLibraries/AimAssist.plist
           cp igamegod/DEBIAN/control /tmp/igdeb/DEBIAN/control
           chmod 755 /tmp/igdeb/DEBIAN/control
-          dpkg-deb -Zgzip -b /tmp/igdeb packages/AimAssist-5.2.0-iGameGod.deb
+          dpkg-deb -Zgzip -b /tmp/igdeb packages/AimAssist-5.3.0-iGameGod.deb
           ls -lh packages/
 
       - name: List Packages

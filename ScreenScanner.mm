@@ -34,6 +34,8 @@
     // 多帧确认跟踪列表（仅后台队列访问）
     NSMutableArray<ESPPlayerData *> *_tracked;
     int _emptyFrames;            // 连续无检测帧计数
+
+    NSMutableArray<NSDictionary *> *_calibColors; // 校准色（用户自定义敌人色）
 }
 @end
 
@@ -57,8 +59,101 @@
         _emptyFrames = 0;
         _tracked = [NSMutableArray array];
         _scanQueue = dispatch_queue_create("com.aimassist.scan", DISPATCH_QUEUE_SERIAL);
+        // 读取持久化的校准色
+        NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:@"com.aimassist.settings"];
+        NSArray *saved = [d objectForKey:@"AimAssist_CalibColors"];
+        if ([saved isKindOfClass:[NSArray class]] && saved.count > 0) {
+            _calibColors = [saved mutableCopy];
+        } else {
+            _calibColors = [NSMutableArray array];
+        }
     }
     return self;
+}
+
+- (NSArray<NSDictionary *> *)calibColors { return _calibColors; }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  校准：截取屏幕中心区域（准心对准敌人时按下），颜色直方图提取 top 主色。
+//  通用于任何引擎/任何颜色的敌人标记。
+//  (ponytail: 3 色代表色 + 容差匹配，足够覆盖单色标记；多色迷彩敌人
+//   校准效果差时可多次校准——新校准覆盖旧色)
+// ═══════════════════════════════════════════════════════════════════════════
+- (void)calibrateWithScreen {
+    UIImage *img = [self captureScreen];
+    if (!img) return;
+    CGImageRef cgImage = img.CGImage;
+    if (!cgImage) return;
+    size_t w = CGImageGetWidth(cgImage), h = CGImageGetHeight(cgImage);
+    size_t bpr = w * 4;
+    NSMutableData *data = [NSMutableData dataWithLength:bpr * h];
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(data.mutableBytes, w, h, 8, bpr, cs,
+                                             kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(cs);
+    if (!ctx) return;
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cgImage);
+    CGContextRelease(ctx);
+    UInt8 *px = data.mutableBytes;
+
+    // 中心 50%×50% 区域（准心对准敌人时，敌人占中心）
+    size_t x0 = w / 4, x1 = w - w / 4, y0 = h / 4, y1 = h - h / 4;
+    int buckets[32768] = {0}; // 15-bit 量化桶 (r>>3)<<10 | (g>>3)<<5 | (b>>3)
+    for (size_t y = y0; y < y1; y++) {
+        for (size_t x = x0; x < x1; x++) {
+            size_t idx = (y * w + x) * 4;
+            UInt8 r = px[idx], g = px[idx + 1], b = px[idx + 2];
+            int lum = (r + g + b) / 3;
+            if (lum < 40 || lum > 225) continue;      // 近黑/近白背景
+            int sat = abs((int)r - g) + abs((int)g - b) + abs((int)r - b);
+            if (sat < 60) continue;                    // 低饱和（灰白 UI 文字）
+            int key = ((int)r >> 3) << 10 | ((int)g >> 3) << 5 | ((int)b >> 3);
+            if (key < 32768) buckets[key]++;
+        }
+    }
+
+    // top 3 主色
+    int topKeys[3] = {-1, -1, -1}, topCnt[3] = {0, 0, 0};
+    for (int k = 0; k < 32768; k++) {
+        int c = buckets[k];
+        if (!c) continue;
+        for (int i = 0; i < 3; i++) {
+            if (c > topCnt[i]) {
+                for (int j = 2; j > i; j--) { topCnt[j] = topCnt[j - 1]; topKeys[j] = topKeys[j - 1]; }
+                topCnt[i] = c; topKeys[i] = k;
+                break;
+            }
+        }
+    }
+
+    NSMutableArray *colors = [NSMutableArray array];
+    for (int i = 0; i < 3; i++) {
+        if (topKeys[i] < 0) continue;
+        int key = topKeys[i];
+        int r = ((key >> 10) & 31) << 3;
+        int g = ((key >> 5) & 31) << 3;
+        int b = (key & 31) << 3;
+        r += 4; g += 4; b += 4; // 量化桶中心
+        r = MIN(255, r); g = MIN(255, g); b = MIN(255, b);
+        [colors addObject:@{@"r": @(r), @"g": @(g), @"b": @(b)}];
+    }
+    if (colors.count == 0) {
+        fprintf(stderr, "[AimAssist] calibrate: no dominant color in center\n");
+        return;
+    }
+    _calibColors = colors;
+    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:@"com.aimassist.settings"];
+    [d setObject:colors forKey:@"AimAssist_CalibColors"];
+    [d synchronize];
+    fprintf(stderr, "[AimAssist] calibrated %lu colors\n", (unsigned long)colors.count);
+}
+
+- (void)clearCalibration {
+    _calibColors = [NSMutableArray array];
+    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:@"com.aimassist.settings"];
+    [d removeObjectForKey:@"AimAssist_CalibColors"];
+    [d synchronize];
+    fprintf(stderr, "[AimAssist] calibration cleared\n");
 }
 
 - (BOOL)isScanning { return _isScanning; }
@@ -131,7 +226,8 @@
                     // 更新 ESP 数据
                     if (entities.count > 0) {
                         [[ESPManager sharedManager] updatePlayers:entities];
-                        [[ESPManager sharedManager] setDataSource:@"屏幕识别"];
+                        [[ESPManager sharedManager] setDataSource:
+                            _calibColors.count > 0 ? @"屏幕识别(校准)" : @"屏幕识别"];
                         _emptyFrames = 0;
                     } else {
                         // 连续多帧无数据后清空
@@ -277,6 +373,20 @@
                 continue;
             }
 
+            // 校准色匹配（用户对准敌人校准的自定义颜色——任何引擎/任何标记色通用）
+            if (_calibColors.count > 0) {
+                for (NSDictionary *c in _calibColors) {
+                    int dr = abs((int)r - [c[@"r"] intValue]);
+                    int dg = abs((int)g - [c[@"g"] intValue]);
+                    int db = abs((int)b - [c[@"b"] intValue]);
+                    if (dr + dg + db < 100) {
+                        detectMap[y * width + x] = 1;
+                        break;
+                    }
+                }
+                if (detectMap[y * width + x] == 1) continue;
+            }
+
             // 肤色（YCrCb 空间，经典范围）：头部/手部人形特征，
             // 用于二次鉴别"这堆红色像素是不是人"
             {
@@ -339,8 +449,11 @@
 
     for (size_t y = 0; y < height; y++) {
         for (size_t x = 0; x < width; x++) {
-            // 聚类只从颜色像素起始（运动像素只能辅助扩展，不能独立成簇 → 移动的 UI/特效不再误报）
-            if (detectMap[y * width + x] != 1 || labels[y * width + x] != 0) continue;
+            // 颜色簇(1) 与运动簇(2) 都可独立成簇；肤色(3) 仅辅助不独立成簇
+            UInt8 seedMark = detectMap[y * width + x];
+            if (seedMark != 1 && seedMark != 2) continue;
+            if (labels[y * width + x] != 0) continue;
+            BOOL isMotionSeed = (seedMark == 2);
 
             // BFS 标记连通区域
             int label = currentLabel++;
@@ -462,8 +575,15 @@
             }
             float enemyFill = (float)pixelCount / ((float)bw * (float)bh);
 
-            // 判定：实心强标记 或 具备人形特征（头部肤色 / 多色方差）
-            if (!(enemyFill > 0.12f || headSkinRatio > 0.015f || bodyVar > 18.0f)) continue;
+            // 判定：颜色簇 → 实心强标记或人形特征；
+            //       运动簇 → 实填充 + 多色方差（无颜色信息，放宽但需过硬过滤 + 多帧确认）
+            BOOL pass;
+            if (isMotionSeed) {
+                pass = (enemyFill > 0.05f && (bodyVar > 12.0f || enemyFill > 0.2f));
+            } else {
+                pass = (enemyFill > 0.12f || headSkinRatio > 0.015f || bodyVar > 18.0f);
+            }
+            if (!pass) continue;
 
             // 去重：检查是否与已检测到的实体重叠
             BOOL duplicate = NO;
