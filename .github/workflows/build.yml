@@ -42,6 +42,27 @@ jobs:
         run: |
           make package FINALPACKAGE=1
 
+      - name: Build iGameGod DEB
+        run: |
+          # 从 rootless deb 提取 dylib，重打包为 iGameGod 专用 deb
+          # (iGameGod 非越狱注入: 经典路径 Library/MobileSubstrate/DynamicLibraries,
+          #  Depends 仅 firmware, 无 postinst, 空 Bundles Filter)
+          brew install dpkg >/dev/null 2>&1 || true
+          DEB=$(find packages -type f -name "*.deb" | head -1)
+          echo "Rootless deb: $DEB"
+          rm -rf /tmp/ig /tmp/igdeb
+          mkdir -p /tmp/ig /tmp/igdeb/Library/MobileSubstrate/DynamicLibraries /tmp/igdeb/DEBIAN
+          dpkg-deb -x "$DEB" /tmp/ig
+          DYLIB=$(find /tmp/ig -type f -name "AimAssist.dylib" | head -1)
+          echo "dylib: $DYLIB"
+          if [ -z "$DYLIB" ]; then echo "::error::dylib not found in deb"; exit 1; fi
+          cp "$DYLIB" /tmp/igdeb/Library/MobileSubstrate/DynamicLibraries/AimAssist.dylib
+          cp igamegod/AimAssist.plist /tmp/igdeb/Library/MobileSubstrate/DynamicLibraries/AimAssist.plist
+          cp igamegod/DEBIAN/control /tmp/igdeb/DEBIAN/control
+          chmod 755 /tmp/igdeb/DEBIAN/control
+          dpkg-deb -Zgzip -b /tmp/igdeb packages/AimAssist-5.0.0-iGameGod.deb
+          ls -lh packages/
+
       - name: List Packages
         run: |
           echo "=== Built packages ==="
@@ -77,5 +98,6 @@ jobs:
 
             ### 兼容性
             - Dopamine 2.5 beta 4+ (rootless)
+            - iGameGod (非越狱侧载, 使用 AimAssist-*-iGameGod.deb)
             - iOS 15.0+
-            - arm64 架构
+            - arm64 架构 (A11 60fps)

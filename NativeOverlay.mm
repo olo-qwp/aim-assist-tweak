@@ -32,6 +32,7 @@
 }
 
 - (void)onDisplayLink:(CADisplayLink *)sender {
+    if (self.hidden || self.window == nil) return; // 隐藏时不浪费帧
     [self setNeedsDisplay];
 }
 
@@ -503,50 +504,21 @@
 - (instancetype)init {
     self = [super init];
     if (self) {
-        [self setupESPView];
+        // 顺序：先建窗口 → 面板 → ESP 视图（ESP 挂到 OverlayWindow，
+        // 这样 keyWindow 截图不会包含 ESP 绘制 → 杜绝检测自反馈）
         [self setupPanelWindow];
         [self setupPanel];
+        [self setupESPView];
     }
     return self;
 }
 
-// ── 创建 ESP 绘制视图，添加到游戏主窗口 ──
+// ── 创建 ESP 绘制视图，挂到独立 OverlayWindow（不参与 keyWindow 截图） ──
 - (void)setupESPView {
-    UIWindow *keyWindow = [self findKeyWindow];
-    if (keyWindow) {
-        _espView = [[ESPDrawView alloc] initWithFrame:keyWindow.bounds];
-        _espView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        [keyWindow addSubview:_espView];
-    }
-}
-
-// ── 查找关键窗口 ──
-- (UIWindow *)findKeyWindow {
-    if (@available(iOS 13.0, *)) {
-        NSSet<UIScene *> *scenes = [UIApplication sharedApplication].connectedScenes;
-        for (UIScene *scene in scenes) {
-            if ([scene isKindOfClass:[UIWindowScene class]]) {
-                UIWindowScene *ws = (UIWindowScene *)scene;
-                if (ws.activationState == UISceneActivationStateForegroundActive) {
-                    for (UIWindow *w in ws.windows) {
-                        if (w.isKeyWindow) return w;
-                    }
-                }
-            }
-        }
-        // 兜底
-        for (UIScene *scene in scenes) {
-            if ([scene isKindOfClass:[UIWindowScene class]]) {
-                UIWindowScene *ws = (UIWindowScene *)scene;
-                for (UIWindow *w in ws.windows) {
-                    if (w.isKeyWindow) return w;
-                }
-            }
-        }
-    }
-    if ([UIApplication sharedApplication].keyWindow)
-        return [UIApplication sharedApplication].keyWindow;
-    return [UIApplication sharedApplication].windows.firstObject;
+    if (!_overlayWindow) return;
+    _espView = [[ESPDrawView alloc] initWithFrame:_overlayWindow.bounds];
+    _espView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [_overlayWindow insertSubview:_espView belowSubview:_panelView];
 }
 
 // ── 创建控制面板窗口 ──
@@ -600,8 +572,7 @@
     if (!_espView || !_espView.superview) {
         [self setupESPView];
     }
-    UIWindow *kw = [self findKeyWindow];
-    if (kw) _espView.frame = kw.bounds;
+    _espView.frame = _overlayWindow.bounds;
     // 启动屏幕扫描器（基于计算机视觉检测真实敌人）
     [[ScreenScanner sharedScanner] startScanning];
 }

@@ -21,9 +21,13 @@
 @interface ScreenScanner () {
     NSTimer *_scanTimer;
     BOOL _isScanning;
+    BOOL _busy;                  // 上一帧分析未完成则跳过本帧（防堆积）
     NSInteger _frameCount;
 
-    // 运动检测用的上一帧
+    // 像素分析专用串行队列（重活全在后台，主线程只做低分辨率截图）
+    dispatch_queue_t _scanQueue;
+
+    // 运动检测用的上一帧（仅后台队列访问）
     UInt8 *_prevFrameData;
     size_t _prevFrameSize;
 }
@@ -48,6 +52,7 @@
         _sensitivity = 0.5f;
         _motionDetectionEnabled = YES;
         _frameCount = 0;
+        _scanQueue = dispatch_queue_create("com.aimassist.scan", DISPATCH_QUEUE_SERIAL);
     }
     return self;
 }
@@ -77,52 +82,58 @@
     _isScanning = NO;
     [_scanTimer invalidate];
     _scanTimer = nil;
-    if (_prevFrameData) {
-        free(_prevFrameData);
-        _prevFrameData = NULL;
-        _prevFrameSize = 0;
-    }
+    // 排空后台队列再释放上一帧（避免与进行中的分析竞争）
+    dispatch_sync(_scanQueue, ^{
+        if (_prevFrameData) {
+            free(_prevFrameData);
+            _prevFrameData = NULL;
+            _prevFrameSize = 0;
+        }
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  主扫描逻辑
+//  主扫描逻辑 — 主线程只做低分辨率截图，像素分析全部在后台队列
+//  (A11 60fps: 主线程每帧开销 ~2-4ms 截图渲染，重循环不占主线程)
 // ═══════════════════════════════════════════════════════════════════════════
 
 - (void)performScan {
     @autoreleasepool {
+        if (_busy || !_isScanning) return;
+        _busy = YES;
         _frameCount++;
 
-        // 截取当前屏幕
+        // 直接以 1/4 线性分辨率截屏（=1/16 像素量，省去全分辨率+降采样两趟）
         UIImage *screenshot = [self captureScreen];
-        if (!screenshot) return;
+        if (!screenshot) { _busy = NO; return; }
+        CGSize origSize = [UIScreen mainScreen].bounds.size;
 
-        // 降采样到 1/4 分辨率
-        CGFloat scale = 0.25f;
-        CGSize newSize = CGSizeMake(screenshot.size.width * scale,
-                                    screenshot.size.height * scale);
-        UIGraphicsBeginImageContextWithOptions(newSize, NO, 1.0);
-        [screenshot drawInRect:CGRectMake(0, 0, newSize.width, newSize.height)];
-        UIImage *smallImage = UIGraphicsGetImageFromCurrentImageContext();
-        UIGraphicsEndImageContext();
+        dispatch_async(_scanQueue, ^{
+            @autoreleasepool {
+                // 分析图像，检测敌人（颜色/运动/聚类，全在后台）
+                NSArray<ESPPlayerData *> *entities =
+                    [self detectEnemiesInImage:screenshot originalSize:origSize];
+                BOOL stillScanning = _isScanning;
 
-        if (!smallImage) return;
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    _busy = NO;
+                    if (!stillScanning) return;
 
-        // 分析图像，检测敌人
-        NSArray<ESPPlayerData *> *entities = [self detectEnemiesInImage:smallImage
-                                                          originalSize:screenshot.size];
-
-        // 更新 ESP 数据
-        if (entities.count > 0) {
-            [[ESPManager sharedManager] updatePlayers:entities];
-        } else {
-            // 连续多帧无数据后清空
-            static int emptyFrames = 0;
-            emptyFrames++;
-            if (emptyFrames > 5) {
-                [[ESPManager sharedManager] updatePlayers:@[]];
-                emptyFrames = 0;
+                    // 更新 ESP 数据
+                    if (entities.count > 0) {
+                        [[ESPManager sharedManager] updatePlayers:entities];
+                    } else {
+                        // 连续多帧无数据后清空
+                        static int emptyFrames = 0;
+                        emptyFrames++;
+                        if (emptyFrames > 5) {
+                            [[ESPManager sharedManager] updatePlayers:@[]];
+                            emptyFrames = 0;
+                        }
+                    }
+                });
             }
-        }
+        });
     }
 }
 
@@ -156,7 +167,9 @@
     if (!keyWindow) return nil;
 
     CGRect bounds = keyWindow.bounds;
-    UIGraphicsBeginImageContextWithOptions(bounds.size, NO, [UIScreen mainScreen].scale);
+    // 直接以 1/4 线性分辨率渲染（=1/16 像素量），跳过全分辨率截屏再降采样
+    CGFloat capScale = [UIScreen mainScreen].scale * 0.25f;
+    UIGraphicsBeginImageContextWithOptions(bounds.size, NO, capScale);
     [keyWindow drawViewHierarchyInRect:bounds afterScreenUpdates:NO];
     UIImage *image = UIGraphicsGetImageFromCurrentImageContext();
     UIGraphicsEndImageContext();

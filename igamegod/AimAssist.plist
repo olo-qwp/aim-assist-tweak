@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Filter</key>
+    <dict>
+        <!-- 空 Bundles 数组 = 注入所有应用（iGameGod 用户手动选择目标游戏） -->
+        <key>Bundles</key>
+        <array/>
+    </dict>
+</dict>
+</plist>
