@@ -1,6 +1,6 @@
 Package: com.aimassist.tweak
 Name: AimAssist
-Version: 5.1.0
+Version: 5.1.1
 Architecture: iphoneos-arm64
 Description: Universal aim assist + ESP overlay for games. Touch-smoothing aim assist (ESP-driven, head lock), screen-scan based enemy detection, skeleton/box/health ESP. No substrate dependency — works on jailbreak (Dopamine) and iGameGod sideload.
 Maintainer: AimAssist

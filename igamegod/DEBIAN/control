@@ -1,6 +1,6 @@
 Package: com.aimassist.tweak.igamegod
 Name: AimAssist
-Version: 5.1.0
+Version: 5.1.1
 Architecture: iphoneos-arm64
 Description: Universal aim assist + ESP overlay for games. Works on any game — select target in iGameGod. No substrate dependency.
 Maintainer: AimAssist

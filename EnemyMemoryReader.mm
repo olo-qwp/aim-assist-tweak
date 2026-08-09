@@ -26,7 +26,7 @@ static il2cpp_domain_get_assemblies_t  g_domain_get_assemblies;
 static il2cpp_assembly_get_image_t     g_assembly_get_image;
 static il2cpp_image_get_name_t         g_image_get_name;
 static il2cpp_class_from_name_t        g_class_from_name;
-static il2cpp_class_get_method_from_name_t       g_method_from_name;
+static il2cpp_class_get_method_from_name_t g_method_from_name;
 static il2cpp_runtime_invoke_t         g_runtime_invoke;
 static il2cpp_string_new_t             g_string_new;
 static il2cpp_array_length_t           g_array_length;
@@ -46,12 +46,15 @@ static const char *kExcludeNames[] = {
 };
 static const int kExcludeNameCount = 7;
 
+// ── 抛过异常的 tag（tag 未定义时 Unity 每次调用都抛托管异常，
+//    捕获一次后永久跳过，避免每 tick 异常开销） ──
+static BOOL g_badTag[kEnemyTagCount];
+
 // ── arm64: Il2CppObject 头 16 字节(klass+monitor)，boxed struct 数据从 16 开始 ──
 static float *AA_boxedFloats(void *boxed) { return (float *)((char *)boxed + 16); }
 
 @interface EnemyMemoryReader () {
-    dispatch_queue_t _queue;
-    volatile BOOL _running;
+    NSTimer *_timer;           // 主线程 10Hz 轮询（Unity API 要求主线程）
     BOOL _unity;
 
     // 缓存的 Unity 类/方法句柄
@@ -85,8 +88,6 @@ static float *AA_boxedFloats(void *boxed) { return (float *)((char *)boxed + 16)
 - (instancetype)init {
     self = [super init];
     if (self) {
-        _queue = dispatch_queue_create("com.aimassist.memread", DISPATCH_QUEUE_SERIAL);
-        _running = NO;
         _unity = NO;
     }
     return self;
@@ -96,11 +97,12 @@ static float *AA_boxedFloats(void *boxed) { return (float *)((char *)boxed + 16)
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  探测 il2cpp + 缓存 Unity 类/方法
+//  （纯 C API + 元数据查询，无托管调用，主线程执行更稳妥）
 // ═══════════════════════════════════════════════════════════════════════════
 - (BOOL)probeUnity {
 #define AA_DLSYM(name, var) \
     var = (name##_t)dlsym(RTLD_DEFAULT, #name); \
-    if (!var) { fprintf(stderr, "[AimAssist] mem: missing %s\n", #name); return NO; }
+    if (!var) return NO;
 
     AA_DLSYM(il2cpp_domain_get, g_domain_get);
     AA_DLSYM(il2cpp_domain_get_assemblies, g_domain_get_assemblies);
@@ -134,7 +136,7 @@ static float *AA_boxedFloats(void *boxed) { return (float *)((char *)boxed + 16)
             if (g_class_from_name(img, "UnityEngine", "GameObject")) { unityImage = img; break; }
         }
     }
-    if (!unityImage) { fprintf(stderr, "[AimAssist] mem: no Unity image\n"); return NO; }
+    if (!unityImage) return NO;
 
     _gameObjectClass = g_class_from_name(unityImage, "UnityEngine", "GameObject");
     _transformClass  = g_class_from_name(unityImage, "UnityEngine", "Transform");
@@ -148,23 +150,29 @@ static float *AA_boxedFloats(void *boxed) { return (float *)((char *)boxed + 16)
     _mGetMain      = g_method_from_name(_cameraClass, "get_main", 0);
     _mGetWTC       = g_method_from_name(_cameraClass, "get_worldToCameraMatrix", 0);
     _mGetProj      = g_method_from_name(_cameraClass, "get_projectionMatrix", 0);
-    if (!_mFindByTag || !_mGetTransform || !_mGetName || !_mGetPosition) {
-        fprintf(stderr, "[AimAssist] mem: missing methods\n");
-        return NO;
-    }
+    if (!_mFindByTag || !_mGetTransform || !_mGetName || !_mGetPosition) return NO;
     return YES;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  相机矩阵：vp = projection * worldToCamera（列主序）
+//  ⚠️ 所有 runtime_invoke 必须传异常输出参数——IL2CPP 遇到托管异常
+//     且无接收者时会直接 abort 进程（闪退根因）
 // ═══════════════════════════════════════════════════════════════════════════
 - (BOOL)refreshCameraMatrix {
     if (!_mGetMain || !_mGetWTC || !_mGetProj) return NO;
-    void *cam = g_runtime_invoke(_mGetMain, NULL, NULL, NULL);
-    if (!cam) return NO;
-    void *wtcBox = g_runtime_invoke(_mGetWTC, cam, NULL, NULL);
-    void *projBox = g_runtime_invoke(_mGetProj, cam, NULL, NULL);
-    if (!wtcBox || !projBox) return NO;
+    void *exc = NULL;
+    void *cam = g_runtime_invoke(_mGetMain, NULL, NULL, &exc);
+    if (exc || !cam) return NO; // 场景切换时主相机可能短暂为 null
+
+    exc = NULL;
+    void *wtcBox = g_runtime_invoke(_mGetWTC, cam, NULL, &exc);
+    if (exc || !wtcBox) return NO;
+
+    exc = NULL;
+    void *projBox = g_runtime_invoke(_mGetProj, cam, NULL, &exc);
+    if (exc || !projBox) return NO;
+
     const float *V = AA_boxedFloats(wtcBox);
     const float *P = AA_boxedFloats(projBox);
     for (int c = 0; c < 4; c++)
@@ -192,7 +200,7 @@ static float *AA_boxedFloats(void *boxed) { return (float *)((char *)boxed + 16)
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  读取敌人：tag 查找 → 名称过滤 → 世界坐标投影 → ESPPlayerData
-//  任一环节失败返回 nil（调用方回退屏幕识别）
+//  任一环节托管异常/失败返回 nil（调用方回退屏幕识别）
 // ═══════════════════════════════════════════════════════════════════════════
 - (NSArray<ESPPlayerData *> *)readEnemies {
     if (!_unity || !_mFindByTag) return nil;
@@ -201,9 +209,13 @@ static float *AA_boxedFloats(void *boxed) { return (float *)((char *)boxed + 16)
 
     NSMutableArray *out = [NSMutableArray array];
     for (int t = 0; t < kEnemyTagCount && out.count < 8; t++) {
+        if (g_badTag[t]) continue; // 该 tag 未定义/异常过，跳过
+
         void *tagStr = g_string_new(kEnemyTags[t]);
         void *params[1] = { tagStr };
-        void *arr = g_runtime_invoke(_mFindByTag, NULL, params, NULL);
+        void *exc = NULL;
+        void *arr = g_runtime_invoke(_mFindByTag, NULL, params, &exc);
+        if (exc) { g_badTag[t] = YES; continue; } // tag 未定义 → 永久跳过
         if (!arr) continue;
         size_t len = g_array_length ? g_array_length(arr) : 0;
         if (len == 0 || len > 64) continue; // 上限防异常数据
@@ -214,7 +226,9 @@ static float *AA_boxedFloats(void *boxed) { return (float *)((char *)boxed + 16)
 
             // 名称过滤：排除友军/玩家（tag 命中但名字明显友方的跳过）
             if (_mGetName && g_string_chars && g_string_length) {
-                void *nameStr = g_runtime_invoke(_mGetName, go, NULL, NULL);
+                exc = NULL;
+                void *nameStr = g_runtime_invoke(_mGetName, go, NULL, &exc);
+                if (exc) continue; // 对象已销毁等 → 跳过该对象
                 if (nameStr) {
                     int ln = g_string_length(nameStr);
                     if (ln > 0 && ln < 64) {
@@ -231,10 +245,12 @@ static float *AA_boxedFloats(void *boxed) { return (float *)((char *)boxed + 16)
             }
 
             // Transform 世界坐标
-            void *tr = g_runtime_invoke(_mGetTransform, go, NULL, NULL);
-            if (!tr) continue;
-            void *posBox = g_runtime_invoke(_mGetPosition, tr, NULL, NULL);
-            if (!posBox) continue;
+            exc = NULL;
+            void *tr = g_runtime_invoke(_mGetTransform, go, NULL, &exc);
+            if (exc || !tr) continue;
+            exc = NULL;
+            void *posBox = g_runtime_invoke(_mGetPosition, tr, NULL, &exc);
+            if (exc || !posBox) continue;
             float *v = AA_boxedFloats(posBox);
 
             // 脚底 + 头顶（人体 ~1.7m）投影
@@ -279,7 +295,7 @@ static float *AA_boxedFloats(void *boxed) { return (float *)((char *)boxed + 16)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  10Hz 后台轮询
+//  主线程 10Hz 轮询（Unity API 大多要求主线程；NSTimer 天然串行无重入）
 // ═══════════════════════════════════════════════════════════════════════════
 - (void)tick {
     @autoreleasepool {
@@ -299,21 +315,24 @@ static float *AA_boxedFloats(void *boxed) { return (float *)((char *)boxed + 16)
 }
 
 - (void)start {
-    if (_running) return;
-    _running = YES;
-    dispatch_async(_queue, ^{
-        _unity = [self probeUnity];
-        fprintf(stderr, "[AimAssist] memory enemy reader: %s\n",
-                _unity ? "Unity IL2CPP available" : "unavailable -> screen scan fallback");
-        while (_running) {
-            [self tick];
-            usleep(100000); // 10Hz（后台串行队列，阻塞无妨）
-        }
-    });
+    if (_timer) return; // 幂等
+    _unity = [self probeUnity];
+    fprintf(stderr, "[AimAssist] memory enemy reader: %s\n",
+            _unity ? "Unity IL2CPP available" : "unavailable -> screen scan fallback");
+    if (!_unity) return;
+    memset(g_badTag, 0, sizeof(g_badTag));
+    _emptyCount = 0;
+    _timer = [NSTimer scheduledTimerWithTimeInterval:0.1
+                                              target:self
+                                            selector:@selector(tick)
+                                            userInfo:nil
+                                             repeats:YES];
+    [self tick]; // 立即执行一次
 }
 
 - (void)stop {
-    _running = NO;
+    [_timer invalidate];
+    _timer = nil;
 }
 
 @end
