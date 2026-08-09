@@ -6,8 +6,6 @@
 @interface ESPManager ()
 @property (nonatomic, strong) NSArray<ESPPlayerData *> *players;
 @property (nonatomic, strong) dispatch_queue_t queue;
-@property (nonatomic, assign) BOOL memoryActive;
-@property (nonatomic, strong) NSString *dataSource;
 @end
 
 @implementation ESPManager
