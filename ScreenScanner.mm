@@ -94,7 +94,7 @@
     if (!ctx) return;
     CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cgImage);
     CGContextRelease(ctx);
-    UInt8 *px = data.mutableBytes;
+    UInt8 *px = (UInt8 *)data.mutableBytes;
 
     // 中心 50%×50% 区域（准心对准敌人时，敌人占中心）
     size_t x0 = w / 4, x1 = w - w / 4, y0 = h / 4, y1 = h - h / 4;
