@@ -242,7 +242,7 @@ static float *AA_boxedFloats(void *boxed) { return (float *)((char *)boxed + 16)
             if (![self worldToScreenX:v[0] y:v[1] z:v[2] out:&feet]) continue;
             if (![self worldToScreenX:v[0] y:v[1] + 1.7f z:v[2] out:&head]) continue;
 
-            float boxH = fabsf(head.y - feet.y);
+            float boxH = fabs(head.y - feet.y);
             if (boxH < ss.height * 0.03f || boxH > ss.height * 1.2f) continue;
             float boxW = boxH * 0.45f;
             CGPoint center = CGPointMake((head.x + feet.x) * 0.5f, (head.y + feet.y) * 0.5f);
