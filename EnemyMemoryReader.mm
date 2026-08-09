@@ -20,6 +20,8 @@ typedef void *(*il2cpp_string_new_t)(const char *);
 typedef size_t (*il2cpp_array_length_t)(void *);
 typedef const uint16_t *(*il2cpp_string_chars_t)(void *);
 typedef int32_t (*il2cpp_string_length_t)(void *);
+typedef void *(*il2cpp_class_get_type_t)(void *);
+typedef void *(*il2cpp_type_get_object_t)(void *);
 
 static il2cpp_domain_get_t             g_domain_get;
 static il2cpp_domain_get_assemblies_t  g_domain_get_assemblies;
@@ -32,6 +34,8 @@ static il2cpp_string_new_t             g_string_new;
 static il2cpp_array_length_t           g_array_length;
 static il2cpp_string_chars_t           g_string_chars;
 static il2cpp_string_length_t          g_string_length;
+static il2cpp_class_get_type_t         g_class_get_type;
+static il2cpp_type_get_object_t        g_type_get_object;
 
 // ── 敌人 tag 列表（FPS/动作游戏通用敌人标签） ──
 static const char *kEnemyTags[] = {
@@ -40,18 +44,40 @@ static const char *kEnemyTags[] = {
 };
 static const int kEnemyTagCount = 12;
 
-// ── 名称排除词（避免把友军/自己当敌人） ──
+// ── 名称排除词（避免把友军/自己/环境当敌人） ──
 static const char *kExcludeNames[] = {
-    "Player", "Ally", "Friend", "Team", "Friendly", "Hero", "Character"
+    "Player", "Ally", "Friend", "Team", "Friendly", "Hero", "Character",
+    "Camera", "Light", "Terrain", "Water", "Environment", "Building",
+    "Wall", "Floor", "Ground", "Tree", "Rock", "Door", "Canvas", "UI",
+    "PostProcess", "Skybox", "Audio", "EventSystem", "Vehicle"
 };
-static const int kExcludeNameCount = 7;
+static const int kExcludeNameCount = 28;
 
-// ── 抛过异常的 tag（tag 未定义时 Unity 每次调用都抛托管异常，
-//    捕获一次后永久跳过，避免每 tick 异常开销） ──
+// ── 路径B：组件类型查找（敌人几乎都有角色控制器/胶囊碰撞体） ──
+static const char *kComponentTypes[] = {
+    "CharacterController", "CapsuleCollider", "Collider"
+};
+static const int kComponentTypeCount = 3;
+
+// ── 路径B：常见敌人脚本组件（Assembly-CSharp 里探测，命中即敌人） ──
+static const char *kEnemyScriptTypes[] = {
+    "Health", "EnemyHealth", "EnemyAI", "EnemyController", "Zombie",
+    "Mob", "Monster", "Enemy", "NPC", "Guard"
+};
+static const int kEnemyScriptTypeCount = 10;
+
+// ── 抛过异常的 tag/类型（Unity 未定义 tag 或组件类不存在时每次调用都抛
+//    托管异常，捕获一次后永久跳过，避免每 tick 异常开销） ──
 static BOOL g_badTag[kEnemyTagCount];
+static BOOL g_badComponent[kComponentTypeCount];
+static BOOL g_badScript[kEnemyScriptTypeCount];
+static BOOL g_badScenePath;   // 场景遍历路径整体失败（无 SceneManager API 等）
 
 // ── arm64: Il2CppObject 头 16 字节(klass+monitor)，boxed struct 数据从 16 开始 ──
 static float *AA_boxedFloats(void *boxed) { return (float *)((char *)boxed + 16); }
+
+// ── 世界坐标去重（同一敌人可能被多条路径命中） ──
+typedef struct { float x, y, z; } AA_WPos;
 
 @interface EnemyMemoryReader () {
     NSTimer *_timer;           // 主线程 10Hz 轮询（Unity API 要求主线程）
@@ -61,13 +87,23 @@ static float *AA_boxedFloats(void *boxed) { return (float *)((char *)boxed + 16)
     void *_gameObjectClass;
     void *_transformClass;
     void *_cameraClass;
+    void *_componentClass;     // UnityEngine.Component
+    void *_objectClass;        // UnityEngine.Object
+    void *_sceneClass;         // UnityEngine.SceneManagement.Scene
+    void *_sceneManagerClass;  // UnityEngine.SceneManagement.SceneManager
     void *_mFindByTag;     // GameObject.FindGameObjectsWithTag(string)
+    void *_mFindOfType;    // Object.FindObjectsOfType(System.Type) [static]
     void *_mGetTransform;  // GameObject.get_transform
     void *_mGetName;       // GameObject.get_name
     void *_mGetPosition;   // Transform.get_position
     void *_mGetMain;       // Camera.get_main (static)
     void *_mGetWTC;        // Camera.get_worldToCameraMatrix
     void *_mGetProj;       // Camera.get_projectionMatrix
+    void *_mCompGameObj;   // Component.get_gameObject
+    void *_mGetActiveScene;// SceneManager.GetActiveScene (static)
+    void *_mGetRootGO;     // Scene.GetRootGameObjects
+    void *_mGetChildCount; // Transform.GetChildCount
+    void *_mGetChild;      // Transform.GetChild(int)
 
     float _vp[16];         // 投影矩阵 = projection * view（列主序）
     int _emptyCount;       // 连续空帧计数（≥3 时释放数据源让位屏幕识别）
@@ -96,8 +132,7 @@ static float *AA_boxedFloats(void *boxed) { return (float *)((char *)boxed + 16)
 - (BOOL)isUnityAvailable { return _unity; }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  探测 il2cpp + 缓存 Unity 类/方法
-//  （纯 C API + 元数据查询，无托管调用，主线程执行更稳妥）
+//  探测 il2cpp + 缓存 Unity 类/方法（纯元数据查询，无托管调用）
 // ═══════════════════════════════════════════════════════════════════════════
 - (BOOL)probeUnity {
 #define AA_DLSYM(name, var) \
@@ -115,9 +150,12 @@ static float *AA_boxedFloats(void *boxed) { return (float *)((char *)boxed + 16)
     AA_DLSYM(il2cpp_array_length, g_array_length);
     AA_DLSYM(il2cpp_string_chars, g_string_chars);
     AA_DLSYM(il2cpp_string_length, g_string_length);
+    // 类型路径 API 非必需：缺失则仅用 tag 路径
+    g_class_get_type  = (il2cpp_class_get_type_t)dlsym(RTLD_DEFAULT, "il2cpp_class_get_type");
+    g_type_get_object = (il2cpp_type_get_object_t)dlsym(RTLD_DEFAULT, "il2cpp_type_get_object");
 #undef AA_DLSYM
 
-    // 找 UnityEngine CoreModule image
+    // 找 UnityEngine.CoreModule image
     void *domain = g_domain_get();
     if (!domain) return NO;
     size_t n = 0;
@@ -130,7 +168,6 @@ static float *AA_boxedFloats(void *boxed) { return (float *)((char *)boxed + 16)
         if (strstr(nm, "UnityEngine") && strstr(nm, "CoreModule")) { unityImage = img; break; }
     }
     if (!unityImage) {
-        // 兜底：遍历所有 image 找含 GameObject 类的
         for (size_t i = 0; i < n; i++) {
             void *img = g_assembly_get_image(assems[i]);
             if (g_class_from_name(img, "UnityEngine", "GameObject")) { unityImage = img; break; }
@@ -141,6 +178,10 @@ static float *AA_boxedFloats(void *boxed) { return (float *)((char *)boxed + 16)
     _gameObjectClass = g_class_from_name(unityImage, "UnityEngine", "GameObject");
     _transformClass  = g_class_from_name(unityImage, "UnityEngine", "Transform");
     _cameraClass     = g_class_from_name(unityImage, "UnityEngine", "Camera");
+    _componentClass  = g_class_from_name(unityImage, "UnityEngine", "Component");
+    _objectClass     = g_class_from_name(unityImage, "UnityEngine", "Object");
+    _sceneClass      = g_class_from_name(unityImage, "UnityEngine", "Scene");
+    _sceneManagerClass = g_class_from_name(unityImage, "UnityEngine", "SceneManager");
     if (!_gameObjectClass || !_transformClass || !_cameraClass) return NO;
 
     _mFindByTag    = g_method_from_name(_gameObjectClass, "FindGameObjectsWithTag", 1);
@@ -151,6 +192,15 @@ static float *AA_boxedFloats(void *boxed) { return (float *)((char *)boxed + 16)
     _mGetWTC       = g_method_from_name(_cameraClass, "get_worldToCameraMatrix", 0);
     _mGetProj      = g_method_from_name(_cameraClass, "get_projectionMatrix", 0);
     if (!_mFindByTag || !_mGetTransform || !_mGetName || !_mGetPosition) return NO;
+
+    // 路径B/C 可选方法（缺失则对应路径自动禁用）
+    if (_componentClass)  _mCompGameObj   = g_method_from_name(_componentClass, "get_gameObject", 0);
+    if (_objectClass && g_class_get_type && g_type_get_object)
+        _mFindOfType = g_method_from_name(_objectClass, "FindObjectsOfType", 1);
+    if (_sceneManagerClass) _mGetActiveScene = g_method_from_name(_sceneManagerClass, "GetActiveScene", 0);
+    if (_sceneClass) _mGetRootGO = g_method_from_name(_sceneClass, "GetRootGameObjects", 0);
+    _mGetChildCount = g_method_from_name(_transformClass, "GetChildCount", 0);
+    _mGetChild      = g_method_from_name(_transformClass, "GetChild", 1);
     return YES;
 }
 
@@ -163,7 +213,7 @@ static float *AA_boxedFloats(void *boxed) { return (float *)((char *)boxed + 16)
     if (!_mGetMain || !_mGetWTC || !_mGetProj) return NO;
     void *exc = NULL;
     void *cam = g_runtime_invoke(_mGetMain, NULL, NULL, &exc);
-    if (exc || !cam) return NO; // 场景切换时主相机可能短暂为 null
+    if (exc || !cam) return NO;
 
     exc = NULL;
     void *wtcBox = g_runtime_invoke(_mGetWTC, cam, NULL, &exc);
@@ -184,13 +234,12 @@ static float *AA_boxedFloats(void *boxed) { return (float *)((char *)boxed + 16)
     return YES;
 }
 
-// 世界坐标 → 屏幕坐标（Unity: clip = vp * world）
 - (BOOL)worldToScreenX:(float)x y:(float)y z:(float)z out:(CGPoint *)pt {
     float cx = _vp[0]*x + _vp[4]*y + _vp[8]*z + _vp[12];
     float cy = _vp[1]*x + _vp[5]*y + _vp[9]*z + _vp[13];
     float cz = _vp[2]*x + _vp[6]*y + _vp[10]*z + _vp[14];
     float cw = _vp[3]*x + _vp[7]*y + _vp[11]*z + _vp[15];
-    if (cw <= 1e-6f || cz > cw) return NO; // 相机后方 / 远平面外
+    if (cw <= 1e-6f || cz > cw) return NO;
     float nx = cx / cw, ny = cy / cw;
     CGSize ss = [UIScreen mainScreen].bounds.size;
     pt->x = (nx * 0.5f + 0.5f) * ss.width;
@@ -199,98 +248,257 @@ static float *AA_boxedFloats(void *boxed) { return (float *)((char *)boxed + 16)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  读取敌人：tag 查找 → 名称过滤 → 世界坐标投影 → ESPPlayerData
-//  任一环节托管异常/失败返回 nil（调用方回退屏幕识别）
+//  名称过滤：排除友军/玩家/环境对象
 // ═══════════════════════════════════════════════════════════════════════════
-- (NSArray<ESPPlayerData *> *)readEnemies {
-    if (!_unity || !_mFindByTag) return nil;
-    if (![self refreshCameraMatrix]) return nil;
+- (BOOL)nameIsExcluded:(void *)go {
+    if (!_mGetName || !g_string_chars || !g_string_length) return NO;
+    void *exc = NULL;
+    void *nameStr = g_runtime_invoke(_mGetName, go, NULL, &exc);
+    if (exc) return YES; // 对象已销毁
+    if (!nameStr) return NO;
+    int ln = g_string_length(nameStr);
+    if (ln <= 0 || ln >= 64) return NO;
+    const uint16_t *ch = g_string_chars(nameStr);
+    char buf[128]; int bl = 0;
+    for (int j = 0; j < ln && bl < 120; j++) buf[bl++] = (char)ch[j];
+    buf[bl] = 0;
+    for (int e = 0; e < kExcludeNameCount; e++)
+        if (strcasestr(buf, kExcludeNames[e])) return YES;
+    return NO;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  由 GameObject 生成 ESPPlayerData（世界坐标投影 + 骨骼点）
+//  返回 nil 表示不可见/尺寸异常
+// ═══════════════════════════════════════════════════════════════════════════
+- (ESPPlayerData *)makePlayerFromGameObject:(void *)go
+                                      world:(AA_WPos)w
+                                     outIdx:(int)idx {
     CGSize ss = [UIScreen mainScreen].bounds.size;
+    CGPoint feet, head;
+    if (![self worldToScreenX:w.x y:w.y z:w.z out:&feet]) return nil;
+    if (![self worldToScreenX:w.x y:w.y + 1.7f z:w.z out:&head]) return nil;
 
-    NSMutableArray *out = [NSMutableArray array];
+    float boxH = fabs(head.y - feet.y);
+    if (boxH < ss.height * 0.03f || boxH > ss.height * 1.2f) return nil;
+    float boxW = boxH * 0.45f;
+    CGPoint center = CGPointMake((head.x + feet.x) * 0.5f, (head.y + feet.y) * 0.5f);
+
+    ESPPlayerData *p = [[ESPPlayerData alloc] init];
+    p.isValid = YES;
+    p.isEnemy = YES;
+    p.health = 1.0f;
+    p.screenPos = center;
+    p.hasBones = YES;
+    CGFloat topY = MIN(head.y, feet.y);
+    p.boxRect = CGRectMake(center.x - boxW * 0.5f, topY, boxW, boxH);
+    p->bonePositions[ESPBoneHead]   = head;
+    p->bonePositions[ESPBoneNeck]   = CGPointMake(head.x, head.y + boxH * 0.08f);
+    p->bonePositions[ESPBoneChest]  = CGPointMake(center.x, topY + boxH * 0.22f);
+    p->bonePositions[ESPBonePelvis] = CGPointMake(center.x, topY + boxH * 0.48f);
+    p->bonePositions[ESPBoneLThigh] = CGPointMake(center.x - boxW * 0.18f, topY + boxH * 0.55f);
+    p->bonePositions[ESPBoneLShin]  = CGPointMake(center.x - boxW * 0.15f, topY + boxH * 0.75f);
+    p->bonePositions[ESPBoneLFoot]  = CGPointMake(center.x - boxW * 0.18f, topY + boxH * 0.95f);
+    p->bonePositions[ESPBoneRThigh] = CGPointMake(center.x + boxW * 0.18f, topY + boxH * 0.55f);
+    p->bonePositions[ESPBoneRShin]  = CGPointMake(center.x + boxW * 0.15f, topY + boxH * 0.75f);
+    p->bonePositions[ESPBoneRFoot]  = CGPointMake(center.x + boxW * 0.18f, topY + boxH * 0.95f);
+    p->bonePositions[ESPBoneLUpperArm] = CGPointMake(center.x - boxW * 0.5f, topY + boxH * 0.25f);
+    p->bonePositions[ESPBoneLForearm]  = CGPointMake(center.x - boxW * 0.55f, topY + boxH * 0.42f);
+    p->bonePositions[ESPBoneLHand]     = CGPointMake(center.x - boxW * 0.5f, topY + boxH * 0.55f);
+    p->bonePositions[ESPBoneRUpperArm] = CGPointMake(center.x + boxW * 0.5f, topY + boxH * 0.25f);
+    p->bonePositions[ESPBoneRForearm]  = CGPointMake(center.x + boxW * 0.55f, topY + boxH * 0.42f);
+    p->bonePositions[ESPBoneRHand]     = CGPointMake(center.x + boxW * 0.5f, topY + boxH * 0.55f);
+    p.name = [NSString stringWithFormat:@"M%d", idx];
+    return p;
+}
+
+// 读 GameObject 世界坐标；失败返回 NO
+- (BOOL)worldPosOfGameObject:(void *)go out:(AA_WPos *)w {
+    void *exc = NULL;
+    void *tr = g_runtime_invoke(_mGetTransform, go, NULL, &exc);
+    if (exc || !tr) return NO;
+    exc = NULL;
+    void *posBox = g_runtime_invoke(_mGetPosition, tr, NULL, &exc);
+    if (exc || !posBox) return NO;
+    float *v = AA_boxedFloats(posBox);
+    w->x = v[0]; w->y = v[1]; w->z = v[2];
+    return YES;
+}
+
+// 世界坐标去重：与已有结果距离 <3m 视为同一对象
+- (BOOL)isDuplicate:(AA_WPos)w in:(NSArray *)seen {
+    for (NSValue *v in seen) {
+        AA_WPos o; [v getValue:&o];
+        float dx = w.x - o.x, dy = w.y - o.y, dz = w.z - o.z;
+        if (dx*dx + dy*dy + dz*dz < 9.0f) return YES; // 3m
+    }
+    return NO;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  路径A：tag 查找（Enemy/Zombie/... 12 种）
+// ═══════════════════════════════════════════════════════════════════════════
+- (void)scanByTags:(NSMutableArray *)out seen:(NSMutableArray *)seen {
+    if (!_mFindByTag) return;
     for (int t = 0; t < kEnemyTagCount && out.count < 8; t++) {
-        if (g_badTag[t]) continue; // 该 tag 未定义/异常过，跳过
-
+        if (g_badTag[t]) continue;
         void *tagStr = g_string_new(kEnemyTags[t]);
         void *params[1] = { tagStr };
         void *exc = NULL;
         void *arr = g_runtime_invoke(_mFindByTag, NULL, params, &exc);
-        if (exc) { g_badTag[t] = YES; continue; } // tag 未定义 → 永久跳过
+        if (exc) { g_badTag[t] = YES; continue; }
         if (!arr) continue;
         size_t len = g_array_length ? g_array_length(arr) : 0;
-        if (len == 0 || len > 64) continue; // 上限防异常数据
-        void **items = (void **)((char *)arr + 32); // Il2CppArray: 头16 + bounds8 + maxLength8
+        if (len == 0 || len > 64) continue;
+        void **items = (void **)((char *)arr + 32);
         for (size_t i = 0; i < len && out.count < 8; i++) {
             void *go = items[i];
-            if (!go) continue;
-
-            // 名称过滤：排除友军/玩家（tag 命中但名字明显友方的跳过）
-            if (_mGetName && g_string_chars && g_string_length) {
-                exc = NULL;
-                void *nameStr = g_runtime_invoke(_mGetName, go, NULL, &exc);
-                if (exc) continue; // 对象已销毁等 → 跳过该对象
-                if (nameStr) {
-                    int ln = g_string_length(nameStr);
-                    if (ln > 0 && ln < 64) {
-                        const uint16_t *ch = g_string_chars(nameStr);
-                        char buf[128]; int bl = 0;
-                        for (int j = 0; j < ln && bl < 120; j++) buf[bl++] = (char)ch[j];
-                        buf[bl] = 0;
-                        BOOL skip = NO;
-                        for (int e = 0; e < kExcludeNameCount; e++)
-                            if (strcasestr(buf, kExcludeNames[e])) { skip = YES; break; }
-                        if (skip) continue;
-                    }
-                }
-            }
-
-            // Transform 世界坐标
-            exc = NULL;
-            void *tr = g_runtime_invoke(_mGetTransform, go, NULL, &exc);
-            if (exc || !tr) continue;
-            exc = NULL;
-            void *posBox = g_runtime_invoke(_mGetPosition, tr, NULL, &exc);
-            if (exc || !posBox) continue;
-            float *v = AA_boxedFloats(posBox);
-
-            // 脚底 + 头顶（人体 ~1.7m）投影
-            CGPoint feet, head;
-            if (![self worldToScreenX:v[0] y:v[1] z:v[2] out:&feet]) continue;
-            if (![self worldToScreenX:v[0] y:v[1] + 1.7f z:v[2] out:&head]) continue;
-
-            float boxH = fabs(head.y - feet.y);
-            if (boxH < ss.height * 0.03f || boxH > ss.height * 1.2f) continue;
-            float boxW = boxH * 0.45f;
-            CGPoint center = CGPointMake((head.x + feet.x) * 0.5f, (head.y + feet.y) * 0.5f);
-
-            ESPPlayerData *p = [[ESPPlayerData alloc] init];
-            p.isValid = YES;
-            p.isEnemy = YES;
-            p.health = 1.0f;
-            p.screenPos = center;
-            p.hasBones = YES;
-            CGFloat topY = MIN(head.y, feet.y);
-            p.boxRect = CGRectMake(center.x - boxW * 0.5f, topY, boxW, boxH);
-            p->bonePositions[ESPBoneHead]   = head;
-            p->bonePositions[ESPBoneNeck]   = CGPointMake(head.x, head.y + boxH * 0.08f);
-            p->bonePositions[ESPBoneChest]  = CGPointMake(center.x, topY + boxH * 0.22f);
-            p->bonePositions[ESPBonePelvis] = CGPointMake(center.x, topY + boxH * 0.48f);
-            p->bonePositions[ESPBoneLThigh] = CGPointMake(center.x - boxW * 0.18f, topY + boxH * 0.55f);
-            p->bonePositions[ESPBoneLShin]  = CGPointMake(center.x - boxW * 0.15f, topY + boxH * 0.75f);
-            p->bonePositions[ESPBoneLFoot]  = CGPointMake(center.x - boxW * 0.18f, topY + boxH * 0.95f);
-            p->bonePositions[ESPBoneRThigh] = CGPointMake(center.x + boxW * 0.18f, topY + boxH * 0.55f);
-            p->bonePositions[ESPBoneRShin]  = CGPointMake(center.x + boxW * 0.15f, topY + boxH * 0.75f);
-            p->bonePositions[ESPBoneRFoot]  = CGPointMake(center.x + boxW * 0.18f, topY + boxH * 0.95f);
-            p->bonePositions[ESPBoneLUpperArm] = CGPointMake(center.x - boxW * 0.5f, topY + boxH * 0.25f);
-            p->bonePositions[ESPBoneLForearm]  = CGPointMake(center.x - boxW * 0.55f, topY + boxH * 0.42f);
-            p->bonePositions[ESPBoneLHand]     = CGPointMake(center.x - boxW * 0.5f, topY + boxH * 0.55f);
-            p->bonePositions[ESPBoneRUpperArm] = CGPointMake(center.x + boxW * 0.5f, topY + boxH * 0.25f);
-            p->bonePositions[ESPBoneRForearm]  = CGPointMake(center.x + boxW * 0.55f, topY + boxH * 0.42f);
-            p->bonePositions[ESPBoneRHand]     = CGPointMake(center.x + boxW * 0.5f, topY + boxH * 0.55f);
-            p.name = [NSString stringWithFormat:@"M%d", (int)out.count + 1];
-            [out addObject:p];
+            if (!go || [self nameIsExcluded:go]) continue;
+            AA_WPos w;
+            if (![self worldPosOfGameObject:go out:&w]) continue;
+            if ([self isDuplicate:w in:seen]) continue;
+            ESPPlayerData *p = [self makePlayerFromGameObject:go world:w outIdx:(int)out.count + 1];
+            if (p) { [out addObject:p]; [seen addObject:[NSValue valueWithBytes:&w objCType:@encode(AA_WPos)]]; }
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  路径B：组件类型查找（CharacterController/CapsuleCollider/Collider +
+//  常见敌人脚本），不依赖 tag——很多游戏敌人没有 Enemy tag 但有角色组件
+// ═══════════════════════════════════════════════════════════════════════════
+- (void)scanByComponents:(NSMutableArray *)out seen:(NSMutableArray *)seen {
+    if (!_mFindOfType || !_mCompGameObj) return;
+
+    // B1: 引擎组件类（CoreModule）
+    for (int c = 0; c < kComponentTypeCount && out.count < 8; c++) {
+        if (g_badComponent[c]) continue;
+        void *cls = g_class_from_name(NULL, "UnityEngine", kComponentTypes[c]);
+        if (!cls) { g_badComponent[c] = YES; continue; }
+        [self scanByClass:cls badFlag:&g_badComponent[c] out:out seen:seen];
+    }
+
+    // B2: 常见敌人脚本组件（Assembly-CSharp）
+    if (out.count >= 8) return;
+    void *domain = g_domain_get();
+    size_t n = 0;
+    void **assems = g_domain_get_assemblies(domain, &n);
+    for (int c = 0; c < kEnemyScriptTypeCount && out.count < 8; c++) {
+        if (g_badScript[c]) continue;
+        void *cls = NULL;
+        for (size_t i = 0; i < n && !cls; i++) {
+            void *img = g_assembly_get_image(assems[i]);
+            cls = g_class_from_name(img, "", kEnemyScriptTypes[c]);
+        }
+        if (!cls) { g_badScript[c] = YES; continue; }
+        [self scanByClass:cls badFlag:&g_badScript[c] out:out seen:seen];
+    }
+}
+
+// 用单个类执行 FindObjectsOfType 并收集
+- (void)scanByClass:(void *)cls badFlag:(BOOL *)bad out:(NSMutableArray *)out seen:(NSMutableArray *)seen {
+    void *type = g_class_get_type(cls);
+    if (!type) { *bad = YES; return; }
+    void *typeObj = g_type_get_object(type);
+    if (!typeObj) { *bad = YES; return; }
+    void *params[1] = { typeObj };
+    void *exc = NULL;
+    void *arr = g_runtime_invoke(_mFindOfType, NULL, params, &exc);
+    if (exc) { *bad = YES; return; }
+    if (!arr) return;
+    size_t len = g_array_length ? g_array_length(arr) : 0;
+    if (len == 0 || len > 256) return;
+    void **items = (void **)((char *)arr + 32);
+    for (size_t i = 0; i < len && out.count < 8; i++) {
+        void *comp = items[i];
+        if (!comp) continue;
+        exc = NULL;
+        void *go = g_runtime_invoke(_mCompGameObj, comp, NULL, &exc);
+        if (exc || !go) continue;
+        if ([self nameIsExcluded:go]) continue;
+        AA_WPos w;
+        if (![self worldPosOfGameObject:go out:&w]) continue;
+        if ([self isDuplicate:w in:seen]) continue;
+        ESPPlayerData *p = [self makePlayerFromGameObject:go world:w outIdx:(int)out.count + 1];
+        if (p) { [out addObject:p]; [seen addObject:[NSValue valueWithBytes:&w objCType:@encode(AA_WPos)]]; }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  路径C：场景根对象遍历（完全不依赖 tag/组件约定，兜底）
+//  递归 transform 树，名称过滤 + 高度验证
+//  (ponytail: 每帧限制 200 个节点防性能问题；深度 ≤6)
+// ═══════════════════════════════════════════════════════════════════════════
+- (void)scanSceneTree:(NSMutableArray *)out seen:(NSMutableArray *)seen {
+    if (g_badScenePath || !_mGetActiveScene || !_mGetRootGO || !_mGetChildCount || !_mGetChild)
+        return;
+    void *exc = NULL;
+    void *sceneBox = g_runtime_invoke(_mGetActiveScene, NULL, NULL, &exc);
+    if (exc || !sceneBox) { g_badScenePath = YES; return; }
+    exc = NULL;
+    void *arr = g_runtime_invoke(_mGetRootGO, sceneBox, NULL, &exc);
+    if (exc || !arr) { g_badScenePath = YES; return; }
+    size_t len = g_array_length ? g_array_length(arr) : 0;
+    if (len > 128) return;
+    void **items = (void **)((char *)arr + 32);
+    int budget = 200;
+
+    for (size_t i = 0; i < len && out.count < 8; i++) {
+        void *go = items[i];
+        if (!go || [self nameIsExcluded:go]) continue;
+        budget -= [self walkTransformTree:go depth:0 budget:&budget out:out seen:seen];
+        if (budget <= 0) break;
+    }
+}
+
+- (int)walkTransformTree:(void *)go depth:(int)d budget:(int *)budget
+                     out:(NSMutableArray *)out seen:(NSMutableArray *)seen {
+    if (*budget <= 0 || out.count >= 8) return 0;
+    int visited = 1;
+    (*budget)--;
+    if (d <= 2) { // 只在浅层节点做位置收集（深层多为子部件/装饰）
+        AA_WPos w;
+        if (![self nameIsExcluded:go] &&
+            [self worldPosOfGameObject:go out:&w] &&
+            ![self isDuplicate:w in:seen]) {
+            ESPPlayerData *p = [self makePlayerFromGameObject:go world:w outIdx:(int)out.count + 1];
+            if (p) { [out addObject:p]; [seen addObject:[NSValue valueWithBytes:&w objCType:@encode(AA_WPos)]]; }
+        }
+    }
+    if (d >= 6 || *budget <= 0 || out.count >= 8) return visited;
+    void *exc = NULL;
+    void *tr = g_runtime_invoke(_mGetTransform, go, NULL, &exc);
+    if (exc || !tr) return visited;
+    exc = NULL;
+    void *cntBox = g_runtime_invoke(_mGetChildCount, tr, NULL, &exc);
+    if (exc) return visited;
+    int n = cntBox ? *(int *)AA_boxedFloats(cntBox) : 0;
+    if (n < 0 || n > 32) n = 0;
+    for (int i = 0; i < n && *budget > 0 && out.count < 8; i++) {
+        void *p2[1] = { (void *)(intptr_t)i };
+        exc = NULL;
+        void *childTr = g_runtime_invoke(_mGetChild, tr, p2, &exc);
+        if (exc || !childTr) continue;
+        exc = NULL;
+        void *childGo = g_runtime_invoke(_mCompGameObj ? _mCompGameObj : _mGetTransform, childTr, NULL, &exc);
+        if (exc || !childGo) continue;
+        visited += [self walkTransformTree:childGo depth:d + 1 budget:budget out:out seen:seen];
+    }
+    return visited;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  读取敌人：A(tag) → B(组件) → C(场景遍历)，世界坐标去重合并
+// ═══════════════════════════════════════════════════════════════════════════
+- (NSArray<ESPPlayerData *> *)readEnemies {
+    if (!_unity) return nil;
+    if (![self refreshCameraMatrix]) return nil;
+
+    NSMutableArray *out = [NSMutableArray array];
+    NSMutableArray *seen = [NSMutableArray array];
+    [self scanByTags:out seen:seen];
+    [self scanByComponents:out seen:seen];
+    [self scanSceneTree:out seen:seen];
     return out;
 }
 
@@ -315,19 +523,22 @@ static float *AA_boxedFloats(void *boxed) { return (float *)((char *)boxed + 16)
 }
 
 - (void)start {
-    if (_timer) return; // 幂等
+    if (_timer) return;
     _unity = [self probeUnity];
     fprintf(stderr, "[AimAssist] memory enemy reader: %s\n",
             _unity ? "Unity IL2CPP available" : "unavailable -> screen scan fallback");
     if (!_unity) return;
     memset(g_badTag, 0, sizeof(g_badTag));
+    memset(g_badComponent, 0, sizeof(g_badComponent));
+    memset(g_badScript, 0, sizeof(g_badScript));
+    g_badScenePath = NO;
     _emptyCount = 0;
     _timer = [NSTimer scheduledTimerWithTimeInterval:0.1
                                               target:self
                                             selector:@selector(tick)
                                             userInfo:nil
                                              repeats:YES];
-    [self tick]; // 立即执行一次
+    [self tick];
 }
 
 - (void)stop {

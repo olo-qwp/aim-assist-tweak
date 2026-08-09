@@ -245,7 +245,7 @@
     UInt8 *pixels = (UInt8 *)pixelData.mutableBytes;
 
     // ── 检测标记图 ──
-    // 每个像素标记为：0=背景, 1=颜色匹配, 2=运动匹配
+    // 每个像素标记为：0=背景, 1=敌人色, 2=运动, 3=肤色
     UInt8 *detectMap = (UInt8 *)calloc(width * height, sizeof(UInt8));
     if (!detectMap) return @[];
 
@@ -275,6 +275,19 @@
             if (r > 170 && b > 170 && g < 90 && (r - g) > 80 && (b - g) > 80) {
                 detectMap[y * width + x] = 1;
                 continue;
+            }
+
+            // 肤色（YCrCb 空间，经典范围）：头部/手部人形特征，
+            // 用于二次鉴别"这堆红色像素是不是人"
+            {
+                int Y  = (int)(0.299f * r + 0.587f * g + 0.114f * b);
+                int Cr = (int)(0.5f * r - 0.4187f * g - 0.0813f * b) + 128;
+                int Cb = (int)(-0.1687f * r - 0.3313f * g + 0.5f * b) + 128;
+                if (Y > 60 && Y < 230 && Cr >= 130 && Cr <= 175 && Cb >= 75 && Cb <= 130) {
+                    if (detectMap[y * width + x] == 0) {
+                        detectMap[y * width + x] = 3;
+                    }
+                }
             }
         }
     }
@@ -408,6 +421,50 @@
             if (fill > 0.40f) continue;
             if (fill < 0.05f) continue;
 
+            // ═══ 人形形态学验证（框内二次鉴别，抑制"红块非人"误报） ═══
+            // 1) 头部肤色：框顶 1/6 区域肤色像素占比（人形必有脸/发）
+            // 2) 颜色方差：人体多色（衣/肤/发），纯色 UI 图标方差低
+            // 3) 实心敌人标记占比：标记本身占满框（豁免上述两条）
+            size_t bw = maxX - minX + 1;
+            size_t bh = maxY - minY + 1;
+            size_t headH = bh / 6 + 1;
+            if (headH > bh) headH = bh;
+            int headSkin = 0, headTotal = 0;
+            for (size_t hy = minY; hy < minY + headH; hy++) {
+                for (size_t hx = minX; hx <= maxX; hx++) {
+                    headTotal++;
+                    if (detectMap[hy * width + hx] == 3) headSkin++;
+                }
+            }
+            float headSkinRatio = headTotal > 0 ? (float)headSkin / headTotal : 0.0f;
+
+            // 框内颜色方差（采样步进 2 降开销）
+            long sumR = 0, sumG = 0, sumB = 0; int n = 0;
+            for (size_t yy = minY; yy <= maxY; yy += 2) {
+                for (size_t xx = minX; xx <= maxX; xx += 2) {
+                    size_t idx = (yy * width + xx) * 4;
+                    sumR += pixels[idx]; sumG += pixels[idx + 1]; sumB += pixels[idx + 2];
+                    n++;
+                }
+            }
+            float bodyVar = 0.0f;
+            if (n > 0) {
+                float avR = (float)sumR / n, avG = (float)sumG / n, avB = (float)sumB / n;
+                float acc = 0.0f; int vn = 0;
+                for (size_t yy = minY; yy <= maxY; yy += 2) {
+                    for (size_t xx = minX; xx <= maxX; xx += 2) {
+                        size_t idx = (yy * width + xx) * 4;
+                        acc += fabsf(pixels[idx] - avR) + fabsf(pixels[idx + 1] - avG) + fabsf(pixels[idx + 2] - avB);
+                        vn++;
+                    }
+                }
+                bodyVar = vn > 0 ? acc / vn : 0.0f;
+            }
+            float enemyFill = (float)pixelCount / ((float)bw * (float)bh);
+
+            // 判定：实心强标记 或 具备人形特征（头部肤色 / 多色方差）
+            if (!(enemyFill > 0.12f || headSkinRatio > 0.015f || bodyVar > 18.0f)) continue;
+
             // 去重：检查是否与已检测到的实体重叠
             BOOL duplicate = NO;
             for (ESPPlayerData *existing in results) {
@@ -433,7 +490,21 @@
                                         boxW, boxH);
 
             // 生成骨骼数据（基于检测到的边界框）
+            // 头部精化：框顶 1/6 区域有肤色 → 用肤色质心当真实头部（自瞄更准）
             CGFloat headY = screenY - boxH * 0.4f;
+            if (headSkinRatio > 0.015f) {
+                long skinSumX = 0, skinSumY = 0; int skinN = 0;
+                for (size_t hy = minY; hy < minY + headH; hy++) {
+                    for (size_t hx = minX; hx <= maxX; hx++) {
+                        if (detectMap[hy * width + hx] == 3) {
+                            skinSumX += hx; skinSumY += hy; skinN++;
+                        }
+                    }
+                }
+                if (skinN > 0) {
+                    headY = ((float)skinSumY / skinN) * scaleY;
+                }
+            }
             entity->bonePositions[ESPBoneHead]      = CGPointMake(screenX, headY);
             entity->bonePositions[ESPBoneNeck]      = CGPointMake(screenX, headY + boxH * 0.08f);
             entity->bonePositions[ESPBoneChest]     = CGPointMake(screenX, screenY - boxH * 0.1f);
