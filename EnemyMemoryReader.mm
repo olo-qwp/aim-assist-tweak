@@ -197,17 +197,20 @@ static size_t cocosVectorSize(void *v) {
     float scale = MIN(ss.width / designW, ss.height / designH);
     if (scale <= 0) return NO;
 
-    // 递归遍历，收集最近节点
+    // 迭代式 DFS（C 栈，避免 block 递归的 retain cycle）
     __block float bestD = 1e18f;
     __block float bestX = 0, bestY = 0, bestSz = 0;
     __block BOOL found = NO;
     __block int budget = 400;
 
-    __block void (^walk)(void *);
-    walk = ^(void *node) {
-        if (budget <= 0) return;
+    void **stack = (void **)malloc(1024 * sizeof(void *));
+    if (!stack) return NO;
+    int sp = 0;
+    stack[sp++] = scene;
+    while (sp > 0 && budget > 0) {
+        void *node = stack[--sp];
+        if (!node) continue;
         budget--;
-        if (!node) return;
 
         uint64_t wv = cocos_Node_getWorldPosition(node);
         float wx = (float)(wv & 0xffffffffu);
@@ -236,13 +239,12 @@ static size_t cocosVectorSize(void *v) {
         if (children) {
             void **items = cocosVectorData(children);
             size_t n = cocosVectorSize(children);
-            for (size_t i = 0; i < n && budget > 0; i++) {
-                if (items[i]) walk(items[i]);
+            for (size_t i = 0; i < n && sp < 1024; i++) {
+                if (items[i]) stack[sp++] = items[i];
             }
         }
-    };
-
-    walk(scene);
+    }
+    free(stack);
 
     if (!found) return NO;
     if (outPos) *outPos = CGPointMake(bestX, bestY);
