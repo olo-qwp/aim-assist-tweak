@@ -4,6 +4,7 @@
 #import "AimAssistManager.h"
 #import "NativeOverlay.h"
 #import "ESPManager.h"
+#import "EnemyMemoryReader.h"
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  v5.0.0 — iGameGod 兼容重构（防闪退 + 去 substrate 依赖）
@@ -146,6 +147,8 @@ static void AA_scheduleShow() {
             AA_swizzleSendEvent();
             [[AimAssistManager sharedManager] loadSettings];
             [[NativeOverlay sharedOverlay] show];
+            // Unity IL2CPP 内存模型敌人检测（后台 10Hz；非 Unity 或未命中自动静默回退屏幕识别）
+            [[EnemyMemoryReader sharedReader] start];
             fprintf(stderr, "[AimAssist] init done (%s)\n", bid.UTF8String);
         } @catch (NSException *e) {
             fprintf(stderr, "[AimAssist] init exception: %s\n", e.name.UTF8String);

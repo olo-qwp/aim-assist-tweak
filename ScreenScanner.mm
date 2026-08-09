@@ -30,6 +30,10 @@
     // 运动检测用的上一帧（仅后台队列访问）
     UInt8 *_prevFrameData;
     size_t _prevFrameSize;
+
+    // 多帧确认跟踪列表（仅后台队列访问）
+    NSMutableArray<ESPPlayerData *> *_tracked;
+    int _emptyFrames;            // 连续无检测帧计数
 }
 @end
 
@@ -50,6 +54,8 @@
         _sensitivity = 0.5f;
         _motionDetectionEnabled = YES;
         _frameCount = 0;
+        _emptyFrames = 0;
+        _tracked = [NSMutableArray array];
         _scanQueue = dispatch_queue_create("com.aimassist.scan", DISPATCH_QUEUE_SERIAL);
     }
     return self;
@@ -80,13 +86,14 @@
     _isScanning = NO;
     [_scanTimer invalidate];
     _scanTimer = nil;
-    // 排空后台队列再释放上一帧（避免与进行中的分析竞争）
+    // 排空后台队列再释放资源（避免与进行中的分析竞争）
     dispatch_sync(_scanQueue, ^{
         if (_prevFrameData) {
             free(_prevFrameData);
             _prevFrameData = NULL;
             _prevFrameSize = 0;
         }
+        [_tracked removeAllObjects];
     });
 }
 
@@ -98,6 +105,8 @@
 - (void)performScan {
     @autoreleasepool {
         if (_busy || !_isScanning) return;
+        // 内存模型检测到真实敌人时，屏幕识别完全让位（避免覆盖精确数据）
+        if ([[ESPManager sharedManager] memoryActive]) return;
         _busy = YES;
         _frameCount++;
 
@@ -108,9 +117,11 @@
 
         dispatch_async(_scanQueue, ^{
             @autoreleasepool {
-                // 分析图像，检测敌人（颜色/运动/聚类，全在后台）
-                NSArray<ESPPlayerData *> *entities =
+                // 分析图像，检测候选敌人（颜色/运动/聚类，全在后台）
+                NSArray<ESPPlayerData *> *cands =
                     [self detectEnemiesInImage:screenshot originalSize:origSize];
+                // 多帧确认：同一位置连续 ≥2 帧出现才算真敌人（大幅抑制误报）
+                NSArray<ESPPlayerData *> *entities = [self stabilize:cands];
                 BOOL stillScanning = _isScanning;
 
                 dispatch_async(dispatch_get_main_queue(), ^{
@@ -120,19 +131,43 @@
                     // 更新 ESP 数据
                     if (entities.count > 0) {
                         [[ESPManager sharedManager] updatePlayers:entities];
+                        [[ESPManager sharedManager] setDataSource:@"屏幕识别"];
+                        _emptyFrames = 0;
                     } else {
                         // 连续多帧无数据后清空
-                        static int emptyFrames = 0;
-                        emptyFrames++;
-                        if (emptyFrames > 5) {
+                        _emptyFrames++;
+                        if (_emptyFrames > 5) {
                             [[ESPManager sharedManager] updatePlayers:@[]];
-                            emptyFrames = 0;
+                            _emptyFrames = 0;
                         }
                     }
                 });
             }
         });
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  多帧确认 — 候选与上一帧位置匹配（<60pt）则计数+1，连续 ≥2 帧才输出。
+//  单帧闪现的红色 UI / 伤害数字 / 特效不再被当作敌人。
+//  (ponytail: O(n²) 线性匹配，≤8 实体无压力；半径 60pt 适合 10fps 帧率)
+// ═══════════════════════════════════════════════════════════════════════════
+- (NSArray<ESPPlayerData *> *)stabilize:(NSArray<ESPPlayerData *> *)cands {
+    NSMutableArray *out = [NSMutableArray array];
+    NSMutableArray *next = [NSMutableArray arrayWithCapacity:cands.count];
+    for (ESPPlayerData *c in cands) {
+        ESPPlayerData *best = nil;
+        CGFloat bestD = 60.0f;
+        for (ESPPlayerData *t in _tracked) {
+            CGFloat d = hypotf(c.screenPos.x - t.screenPos.x, c.screenPos.y - t.screenPos.y);
+            if (d < bestD) { bestD = d; best = t; }
+        }
+        c->stableCount = best ? best->stableCount + 1 : 1;
+        if (c->stableCount >= 2) [out addObject:c];
+        [next addObject:c];
+    }
+    _tracked = next;
+    return out;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -214,8 +249,8 @@
     UInt8 *detectMap = (UInt8 *)calloc(width * height, sizeof(UInt8));
     if (!detectMap) return @[];
 
-    // ── 颜色检测 ──
-    int colorThreshold = (int)(150.0f + (1.0f - _sensitivity) * 50.0f); // 灵敏度越高，阈值越低
+    // ── 颜色检测（收紧阈值 + 饱和度约束，排除暗红/粉红 UI） ──
+    int base = (int)(160.0f + (1.0f - _sensitivity) * 40.0f); // 160~200：灵敏度越高阈值越低
 
     for (size_t y = 0; y < height; y++) {
         for (size_t x = 0; x < width; x++) {
@@ -224,20 +259,20 @@
             UInt8 g = pixels[idx + 1];
             UInt8 b = pixels[idx + 2];
 
-            // 红色系检测（敌人血条/轮廓/伤害标记）
-            if (r > colorThreshold && g < colorThreshold * 0.7f && b < colorThreshold * 0.7f) {
+            // 红色系（敌人血条/轮廓/伤害标记）：要求高饱和纯红
+            if (r > base && g < 90 && b < 90 && (r - g) > 90 && (r - b) > 90) {
                 detectMap[y * width + x] = 1;
                 continue;
             }
 
-            // 橙色系检测（敌人高亮标记）
-            if (r > 200 && g > 100 && g < 180 && b < 100) {
+            // 橙色系（敌人高亮标记）
+            if (r > 210 && g > 110 && g < 190 && b < 80 && (r - b) > 130) {
                 detectMap[y * width + x] = 1;
                 continue;
             }
 
             // 品红/粉色系（部分游戏的敌人标记）
-            if (r > 150 && b > 150 && g < 100) {
+            if (r > 170 && b > 170 && g < 90 && (r - g) > 80 && (b - g) > 80) {
                 detectMap[y * width + x] = 1;
                 continue;
             }
@@ -291,7 +326,8 @@
 
     for (size_t y = 0; y < height; y++) {
         for (size_t x = 0; x < width; x++) {
-            if (detectMap[y * width + x] == 0 || labels[y * width + x] != 0) continue;
+            // 聚类只从颜色像素起始（运动像素只能辅助扩展，不能独立成簇 → 移动的 UI/特效不再误报）
+            if (detectMap[y * width + x] != 1 || labels[y * width + x] != 0) continue;
 
             // BFS 标记连通区域
             int label = currentLabel++;
@@ -342,12 +378,35 @@
             CGFloat boxW = (maxX - minX + 1) * scaleX;
             CGFloat boxH = (maxY - minY + 1) * scaleY;
 
-            // 过滤屏幕边缘的 UI 元素（血条通常在边缘）
+            // ═══ 精度过滤（大幅抑制误报） ═══
+            // 屏幕边缘 UI（血条/击杀提示通常在边缘）
             if (screenX < 20 || screenX > origSize.width - 20) continue;
             if (screenY < 20 || screenY > origSize.height - 20) continue;
 
-            // 长宽比过滤：玩家方框通常高度 > 宽度
-            if (boxH < boxW * 0.5f) continue;
+            // 顶部 HUD 区（血条/小地图/队友列表）与底部操作区（虚拟摇杆/按钮）
+            if (screenY < origSize.height * 0.10f) continue;
+            if (screenY > origSize.height * 0.88f) continue;
+
+            // 屏幕中心准心区（半径 45pt：准心/伤害数字常为红色，是主要误报源）
+            {
+                CGFloat ddx = screenX - origSize.width * 0.5f;
+                CGFloat ddy = screenY - origSize.height * 0.5f;
+                if (ddx * ddx + ddy * ddy < 45.0f * 45.0f) continue;
+            }
+
+            // 宽高比：人体框高显著大于宽（排除方形 UI 图标/文字）
+            if (boxH < boxW * 1.2f) continue;
+            if (boxH > boxW * 6.0f) continue; // 过细长（线条/光效）
+
+            // 尺寸：太小是噪点/远距离忽略，太大是全屏特效
+            if (boxH < origSize.height * 0.05f) continue;
+            if (boxW > origSize.width * 0.5f) continue;
+
+            // 填充率：人体是稀疏轮廓/骨架（低填充），实心色块是 UI 图标
+            float fill = (float)pixelCount /
+                         ((float)(maxX - minX + 1) * (float)(maxY - minY + 1));
+            if (fill > 0.40f) continue;
+            if (fill < 0.05f) continue;
 
             // 去重：检查是否与已检测到的实体重叠
             BOOL duplicate = NO;

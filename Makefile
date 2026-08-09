@@ -11,7 +11,8 @@ AimAssist_FILES = Tweak.xm \
     AimAssistManager.mm \
     NativeOverlay.mm \
     ESPManager.mm \
-    ScreenScanner.mm
+    ScreenScanner.mm \
+    EnemyMemoryReader.mm
 
 AimAssist_FRAMEWORKS = UIKit CoreGraphics QuartzCore CoreImage CoreVideo ImageIO
 AimAssist_CFLAGS   = -fobjc-arc -Wno-deprecated-declarations

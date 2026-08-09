@@ -55,6 +55,7 @@ static const int ESPBoneConnections[] = {
 @interface ESPPlayerData : NSObject {
     @public
     CGPoint bonePositions[ESPBoneCount]; // 骨骼屏幕坐标（C数组，不能用作ObjC属性）
+    int stableCount;                     // 屏幕识别多帧确认计数（内存模型数据不使用）
 }
 @property (nonatomic, assign) BOOL           isValid;       // 数据是否有效
 @property (nonatomic, assign) CGPoint        screenPos;     // 玩家在屏幕上的位置
@@ -88,5 +89,11 @@ static const int ESPBoneConnections[] = {
 @property (nonatomic, assign) BOOL showCrosshair;     // 显示准心
 @property (nonatomic, assign) BOOL showFOV;           // 显示 FOV 圈
 @property (nonatomic, assign) float fovRadius;        // FOV 半径
+
+// ── 数据源协调 ──
+// 内存模型检测有有效数据时为 YES → ScreenScanner 让位，避免覆盖精确数据
+@property (nonatomic, assign) BOOL memoryActive;
+// 当前数据源说明（"内存模型" / "屏幕识别"），供 UI 显示
+@property (nonatomic, strong) NSString *dataSource;
 
 @end

@@ -262,6 +262,7 @@
     UIView *_fullView;
     UILabel *_statusLabel;
     UILabel *_aimStatusLabel;
+    NSTimer *_statusTimer;   // 1Hz 刷新数据源显示
 }
 
 - (instancetype)initWithFrame:(CGRect)frame {
@@ -382,6 +383,23 @@
     _statusLabel.font = [UIFont systemFontOfSize:9];
     _statusLabel.text = @"右半屏瞄准 | 自动锁定FOV内敌人";
     [_fullView addSubview:_statusLabel];
+
+    // 1Hz 数据源状态刷新（内存模型 / 屏幕识别）
+    _statusTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
+                                                    target:self
+                                                  selector:@selector(refreshStatus)
+                                                  userInfo:nil
+                                                   repeats:YES];
+    [self refreshStatus];
+}
+
+- (void)refreshStatus {
+    _statusLabel.text = [NSString stringWithFormat:@"数据源: %@ | 右半屏瞄准",
+                         [ESPManager sharedManager].dataSource ?: @"屏幕识别"];
+}
+
+- (void)dealloc {
+    [_statusTimer invalidate];
 }
 
 // ── 最小化模式 ──
